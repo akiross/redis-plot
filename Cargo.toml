@@ -1,0 +1,19 @@
+[package]
+name = "redis-plot"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+lazy_static = "1.4"
+flume = "0.10"
+redis-module = { version = "1.0.0", features = ["experimental-api"] }
+plotters = "0.3"
+# plotters-cairo = "0.3"
+plotters-cairo = { git = "https://github.com/DusterTheFirst/plotters-cairo", branch = "cairo-rs-0.15.1" }
+cairo-rs = "0.15"
+gtk4 = "0.4"
+gio = "0.15"
+glib = "0.15"
