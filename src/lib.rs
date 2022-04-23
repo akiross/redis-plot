@@ -1,3 +1,10 @@
+/// This module gets built and becomes a cdylib .so file to be loaded in redis and can be
+/// used to plot data from redis. Can be used from a redis client to plot data on demand
+/// or as a watcher, that automatically updates the plot when events change the data.
+///
+/// The module can plot directly over a buffer as a RGB image - which can be read from the
+/// redis client and displayed as preferred - or output to a device (i.e. screen or file).
+
 #[macro_use]
 extern crate redis_module;
 
@@ -5,198 +12,195 @@ extern crate redis_module;
 extern crate lazy_static;
 
 use redis_module::{
-    Context, KeyType, LogLevel, RedisError, RedisResult, RedisString, RedisValue, Status,
-    ThreadSafeContext,
+    Context, LogLevel, NextArg, NotifyEvent, RedisError, RedisResult, RedisString, RedisValue,
+    Status,
 };
 
-use glib::{source::PRIORITY_DEFAULT, MainContext};
+use gtk4::prelude::*;
 
+use plotters::prelude::*;
+use std::collections::HashSet;
+use std::sync::Mutex;
+
+mod utils;
+
+use utils::{build_ui, plot_stuff};
+
+/*
+struct MyApplication {
+    tx: Option<glib::Sender<String>>,
+    rx: Option<glib::Receiver<String>>,
+    out_files: Vec<std::path::PathBuf>,
+}
+
+impl MyApplication {
+    fn new() -> Self {
+        MyApplication {
+            tx: None,
+            rx: None,
+            out_files: vec![],
+        }
+    }
+    /// Sets up a communication channel, returning RX.
+    fn build_chan(&mut self) -> glib::Receiver<String> {
+        let (tx, rx) = glib::MainContext::channel(PRIORITY_DEFAULT);
+        rx
+    }
+
+    unsafe fn get_tx(&self) -> glib::Sender<String> {
+        let (tx, rx) = glib::MainContext::channel(PRIORITY_DEFAULT);
+        tx
+    }
+}
+
+lazy_static! {
+    static ref STATE: MyApplication = MyApplication::new();
+}
+*/
+
+// TODO this must change (to a map?) and allow to send data to different targets, so
+// we can update different windows and/or images.
 static mut CHAN_TX: Option<glib::Sender<String>> = None;
 
-//#[derive(Copy, Clone)]
-//struct Point(f32, f32);
+lazy_static! {
+    static ref BOUND_L: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+}
 
-fn rsp_draw(_: &Context, args: Vec<RedisString>) -> RedisResult {
-    // TODO manage data
-    if args.len() > 1 {
+/// Binds a list name to a plot. Whenever the list gets updated, after the binding,
+/// the plot will be updated. A single argument is needed, with the name of the list.
+// TODO in future, this will also accept a plot type (scatter, lines, histogram...)
+// and a drawing target (window, image).
+fn rsp_bind(_: &Context, args: Vec<RedisString>) -> RedisResult {
+    if args.len() < 2 {
         return Err(RedisError::WrongArity);
     }
 
-    let nums = args
+    let list_name = args
         .into_iter()
         .skip(1)
-        .map(|s| s.parse_integer())
-        .collect::<Result<Vec<i64>, RedisError>>()?;
+        .next_arg()
+        .expect("BUG, list_name arg was not counted properly");
 
-    let product = nums.iter().product();
+    // Bind the list name so we will watch it
+    BOUND_L.lock().unwrap().insert(list_name.to_string());
+    println!("List {} bound", list_name);
 
-    let mut response = nums;
-    response.push(product);
-
-    let tx = unsafe { CHAN_TX.clone() };
-    dbg!(&tx);
-    tx.unwrap().send(product.to_string()).expect("Cannot send");
-    // println!("DATA SENT TO CHANNEL!");
-
-    Ok(response.into())
+    Ok(().into())
 }
 
-fn build_ui(app: &gtk4::Application) {
-    use glib::clone;
-    use glib::Continue;
-    use gtk4::prelude::*;
-    use gtk4::{Application, ApplicationWindow};
+fn on_list_event(ctx: &Context, ev_type: NotifyEvent, event: &str, key: &str) -> RedisResult {
+    println!("Some list event! {:?} {} {}", ev_type, event, key);
+    if BOUND_L.lock().unwrap().contains(key) {
+        // TODO redraw should happen only for the related plot
+        println!("A watched list! Triggering redraw!");
+        return rsp_draw(ctx, vec![]); // FIXME pass arguments here?
+    }
+    Ok(().into())
+}
 
-    // Setup communication channel
-    let (tx, rx) = MainContext::channel(PRIORITY_DEFAULT);
-    unsafe {
-        CHAN_TX = Some(tx);
+/// This is the primitive function for rsp: it takes all the arguments necessary
+/// to determine what to plot, where and how. The first argument is mandatory: it's
+/// the key name for a list, source of data.
+/// TODO The second argument is the kind of plot (e.g. "scatter"), this defaults to "scatter".
+/// TODO The third argument specified the draw target: a window name or a string, this defaults to "-" (string).
+fn rsp_draw(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
+    if args.len() < 2 {
+        return Err(RedisError::WrongArity);
     }
 
-    // Setup drawing area
-    let drawing_area = gtk4::DrawingArea::new();
-    drawing_area.set_draw_func(|_, cr, w, h| {
-        use plotters::prelude::*;
-        let root = plotters_cairo::CairoBackend::new(cr, (w as u32, h as u32)).into_drawing_area();
+    // Parse arguments
+    let mut args = args.into_iter().skip(1);
+    let key = args.next().expect("BUG!").to_string();
+    //let kind = args.next().map_or("scatter".to_string(), |s| s.to_string());
+    //let target = args.next().map_or("-".to_string(), |s| s.to_string());
 
-        // Get access to redis data
-        let thread_ctx = ThreadSafeContext::new();
+    // Read the entire data (TODO there is likely a better way to do this)
+    let els = ctx
+        .call("LRANGE", &[key.as_str(), "0", "-1"])
+        .expect("Cannot lrange");
 
-        let data = {
-            let ctx = thread_ctx.lock();
-            // TODO build a map plot-type -> series-name -> data
-            // Get all keys supported by this
-            // TODO vedere https://github.com/RedisLabsModules/redismodule-rs/blob/master/examples/lists.rs
-            //   per un esempio di come aprire le chiavi e vederne il tipo e agire direttamente
-            //   su di esse
-            // if let Ok(RedisValue::Array(keys)) = ctx.call("KEYS", &["rsp-plot*"]) {
-            //     for key in keys.iter() {
-            //         match key {
-            //             RedisValue::SimpleString(s) => println!("Key: {}", s),
-            //             RedisValue::SimpleStringStatic(s) => println!("Key: {}", s),
-            //             _ => {}
-            //         }
-            //     }
-            // }
+    // println!("Collecting RSP {:?}", els);
+    if let RedisValue::Array(els) = els {
+        let data: Vec<(f32, f32)> = els
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, v)| match v {
+                // FIXME this unwrap shall be changed into a None
+                RedisValue::SimpleString(v) => Some((i as f32, v.parse::<f32>().unwrap())),
+                RedisValue::Integer(v) => Some((i as f32, v as f32)),
+                RedisValue::Float(v) => Some((i as f32, v as f32)),
+                _ => None,
+            })
+            .collect();
 
-            let els = ctx
-                .call("LRANGE", &["rsp", "0", "-1"])
-                .expect("Cannot lrange");
-            // println!("Collecting RSP {:?}", els);
-            if let RedisValue::Array(els) = els {
-                let data: Vec<(f32, f32)> = els
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(i, v)| match v {
-                        // FIXME this unwrap shall be changed into a None
-                        RedisValue::SimpleString(v) => Some((i as f32, v.parse::<f32>().unwrap())),
-                        RedisValue::Integer(v) => Some((i as f32, v as f32)),
-                        RedisValue::Float(v) => Some((i as f32, v as f32)),
-                        _ => None,
-                    })
-                    .collect();
-                data
-            } else {
-                // println!("No rsp list found");
-                vec![]
-            }
-        };
-        // println!("Collected data {:?}", data);
+        // Plot the data on a buffer bitmap
+        let (w, h) = (400, 300);
+        let mut buf: Vec<u8> = vec![0; w * h * 3];
+        let root = BitMapBackend::with_buffer(&mut buf, (w as u32, h as u32)).into_drawing_area();
 
-        root.fill(&WHITE).unwrap();
-        //let root = root.margin(25, 25, 25, 25);
+        plot_stuff(root, data);
 
-        let (x_range, y_range) = {
-            let mut x_min: Option<f32> = None;
-            let mut x_max: Option<f32> = None;
-            let mut y_min: Option<f32> = None;
-            let mut y_max: Option<f32> = None;
+        // Send back the data, prepending encoded width and height
+        Ok(w.to_be_bytes()
+            .into_iter()
+            .chain(h.to_be_bytes().into_iter())
+            .chain(buf.into_iter())
+            .collect::<Vec<u8>>()
+            .into())
+    } else {
+        Err(RedisError::Str("Not an array"))
+    }
 
-            // TODO compute the range of x and y values from data
-            for (x, y) in data.iter() {
-                if x < x_min.get_or_insert(*x) {
-                    x_min.replace(*x);
-                }
-                if x > x_max.get_or_insert(*x) {
-                    x_max.replace(*x);
-                }
-                if y < y_min.get_or_insert(*y) {
-                    y_min.replace(*y);
-                }
-                if y > y_max.get_or_insert(*y) {
-                    y_max.replace(*y);
-                }
-            }
-            if x_min.is_none() || x_max.is_none() || y_min.is_none() || y_max.is_none() {
-                (0.0..0.0, 0.0..0.0)
-            } else {
-                (
-                    x_min.unwrap()..x_max.unwrap(),
-                    y_min.unwrap()..y_max.unwrap(),
-                )
-            }
-        };
-
-        let mut chart = ChartBuilder::on(&root)
-            .margin(25i32)
-            .x_label_area_size(30)
-            .y_label_area_size(30)
-            .caption("RSPlotters", ("sans-serif", 20u32))
-            .build_cartesian_2d(x_range, y_range)
-            .unwrap();
-
-        chart.configure_mesh().draw().unwrap();
-
-        chart.draw_series(LineSeries::new(data, &RED)).unwrap();
-    });
-
-    // let list_box = gtk4::ListBox::new();
-    // list_box.append(&gtk4::Label::new(Some("999".into())));
-
-    rx.attach(
-        None,
-        clone!(@weak drawing_area => @default-return Continue(false),
-        move |_message| {
-            // println!("DATA RECEIVED: {}", message);
-            // let label = gtk4::Label::new(Some(&message));
-            // list_box.append(&label);
-
-            drawing_area.queue_draw();
-            Continue(true)
-        }),
-    );
-
-    // let scrolled = gtk4::ScrolledWindow::builder()
-    //     .hscrollbar_policy(gtk4::PolicyType::Never)
-    //     .child(&list_box)
-    //     .build();
-
-    // We create the main window.
-    let win = ApplicationWindow::builder()
-        .application(app)
-        .default_width(320)
-        .default_height(200)
-        .title("RSP")
-        .child(&drawing_area)
-        .build();
-
-    // Don't forget to make all widgets visible.
-    win.present();
+    /*
+    //let tx = STATE.get_tx();
+    let tx = unsafe { CHAN_TX.clone() }.expect("TX end was None!");
+    dbg!(&tx);
+    tx.send(product.to_string()).expect("Cannot send");
+    println!("DATA SENT TO CHANNEL!");
+    */
 }
 
-fn init_rsp(ctx: &Context, _args: &[RedisString]) -> Status {
-    std::thread::spawn(|| {
-        use gtk4::prelude::*;
-        use gtk4::Application;
+/// This is an echo function used for testing
+fn rsp_echo(_: &Context, args: Vec<RedisString>) -> RedisResult {
+    println!("Called rsp.echo");
+    if args.len() < 2 {
+        return Err(RedisError::WrongArity);
+    }
 
-        let app = Application::builder()
-            .application_id("re.ale.RedisPlot")
-            .build();
+    Ok(RedisValue::from(
+        args.into_iter()
+            .map(|rs| rs.to_string())
+            .collect::<Vec<String>>()
+            .join(", "),
+    ))
+}
 
-        app.connect_activate(build_ui);
+fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
+    if args.len() == 1 {
+        ctx.log(LogLevel::Notice, "Plotting to file");
+    } else {
+        // println!("LOADING MODULE WITH ARGS {:?}", _args);
+        std::thread::spawn(|| {
+            let app = gtk4::Application::builder()
+                .application_id("re.ale.RedisPlot")
+                .build();
 
-        app.run_with_args::<&str>(&[]);
-    });
+            // TODO GTK might render to a window or to a file.
+            // TODO open the window only when needed.
+            // TODO multiple windows are necessary.
+
+            // Activation might be called multiple times, e.g. after being hidden
+            app.connect_activate(|app| {
+                let tx = build_ui(app);
+                // Save the channel so we can send data to it
+                unsafe {
+                    CHAN_TX = Some(tx);
+                }
+            });
+
+            app.run_with_args::<&str>(&[]);
+        });
+    }
 
     ctx.log(LogLevel::Warning, "Initializing rsp!");
     Status::Ok
@@ -208,12 +212,22 @@ fn deinit_rsp(ctx: &Context) -> Status {
 }
 
 redis_module! {
-    name: "rsp",
+    name: "redis_plot",
     version: 1,
     data_types: [],
     init: init_rsp,
     deinit: deinit_rsp,
     commands: [
+        // x are assumed to be natural numbers, but a flag might be used to load them from a list.
         ["rsp.draw", rsp_draw, "", 0, 0, 0],
+        ["rsp.bind", rsp_bind, "", 0, 0, 0],
+        ["rsp.echo", rsp_echo, "", 0, 0, 0],
+        // rsp.line
+        // rsp.dots
+        // rsp.bars a bar for each y-value. more keys will produce side-to-side bars, flag to stack
+        // rsp.hist
     ],
+    event_handlers: [
+        [@LIST: on_list_event]
+    ]
 }

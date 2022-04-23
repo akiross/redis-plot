@@ -9,11 +9,20 @@ crate-type = ["cdylib"]
 [dependencies]
 lazy_static = "1.4"
 flume = "0.10"
-redis-module = { version = "1.0.0", features = ["experimental-api"] }
+redis-module = { version = "1.0.0", features = ["experimental-api", "test"] }
 plotters = "0.3"
+plotters-backend = "0.3"
 # plotters-cairo = "0.3"
 plotters-cairo = { git = "https://github.com/DusterTheFirst/plotters-cairo", branch = "cairo-rs-0.15.1" }
 cairo-rs = "0.15"
 gtk4 = "0.4"
 gio = "0.15"
 glib = "0.15"
+
+[dev-dependencies]
+redis = "0.21"
+anyhow = "1"
+tempfile = "3.3"
+insta = "1.14"
+itertools = "0.10"
+serde = "1"
