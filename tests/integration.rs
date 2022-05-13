@@ -5,7 +5,7 @@
 /// the image for inspection.
 use anyhow::Result;
 use itertools::Itertools;
-use redis::{Client, Commands};
+use redis::Client;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
@@ -29,7 +29,7 @@ impl ServerGuard {
     /// It will attempt connection up to 10 times in 10 seconds, then fail.
     fn get_connection() -> Result<redis::Connection> {
         let client = redis::Client::open("redis://127.0.0.1/").expect("Cannot connect to server");
-        for i in 0..10 {
+        for _ in 0..10 {
             match client.get_connection() {
                 Ok(con) => {
                     // Connected, perform tests
@@ -152,7 +152,8 @@ impl From<Vec<u8>> for RleImage {
 }
 
 /// Integration tests are placed here. There's currently a single test for
-/// performance reasons,
+/// performance reasons. When developing, might be useful to set
+/// REDIS_PLOT_TEST_TARGET_DIR to save some build time.
 #[test]
 fn test_everything() -> Result<(), anyhow::Error> {
     use redis::Commands;
@@ -162,29 +163,86 @@ fn test_everything() -> Result<(), anyhow::Error> {
 
         // This is just a smoke test.
         assert_eq!(
-            redis::cmd("rsp.echo").arg("foo").query(&mut con),
-            Ok("rsp.echo, foo".to_owned())
+            redis::cmd("rsp.echo").arg("foo").arg("bar").query(&mut con),
+            Ok("rsp.echo, foo, bar".to_owned())
         );
+
+        // Set a value which is not a list
+        let _: () = con.set("nl", 123i32)?;
 
         // Build a few lists as plot targets
         let la: i32 = con.rpush("la", vec![1u32, 2, 4, 9, 15, 16, 42])?;
         assert_eq!(la, 7);
-        let lb: i32 = con.rpush("lb", vec![-1, 1, -2, 2, -3, 3, -4, 4])?;
+        let lb: i32 = con.rpush("lb", vec![-1i32, 1, -2, 2, -3, 3, -4, 4])?;
         assert_eq!(lb, 8);
-        con.rpush("lc", vec![0.0, 0.5, 1.75, -2.125])?;
-        con.rpush("ld", vec![0.125, 0, 0, 0, 125, 2.5, 3.0, 3.125, 2.95])?;
+        con.rpush("lc", vec![0.0f32, 0.5, 1.75, -2.125])?;
+        con.rpush(
+            "ld",
+            vec![0.125f32, 0.0, 0.0, 0.0, 125.0, 2.5, 3.0, 3.125, 2.95],
+        )?;
 
-        // Test the rsp.draw command, which plots one list.
+        // Test that rsp.draw is requiring the --list argument with 1+ param.
         {
-            let res: Vec<u8> = redis::cmd("rsp.draw").arg("la").query(&mut con)?;
+            println!("Test #1");
+            assert!(redis::cmd("rsp.draw").query::<()>(&mut con).is_err());
+            assert!(redis::cmd("rsp.draw")
+                .arg("--list")
+                .query::<()>(&mut con)
+                .is_err());
+        }
+
+        // rsp.draw must accept lists only
+        {
+            println!("Test #2");
+            assert!(redis::cmd("rsp.draw")
+                .arg("--list")
+                .arg("nl")
+                .query::<()>(&mut con)
+                .is_err());
+        }
+
+        // Test that rsp.draw can plot one list.
+        {
+            println!("Test #3");
+            let res: Vec<u8> = redis::cmd("rsp.draw")
+                .arg("--list")
+                .arg("la")
+                .query(&mut con)?;
             insta::assert_json_snapshot!(RleImage::from(res));
         }
-        // TODO plot two or more lists together
+
+        // Test that rsp.draw can plot more than one list.
+        {
+            println!("Test #4");
+            let res: Vec<u8> = redis::cmd("rsp.draw")
+                .arg("--list")
+                .arg("la")
+                .arg("lb")
+                .arg("lc")
+                .query(&mut con)?;
+            insta::assert_json_snapshot!(RleImage::from(res));
+        }
+
         // TODO plot one list as scatter, one as lines, one as histograms
+
         // TODO test async plotting: bind a list to a plot and try updating
         {
-            // Bind a list to a plot
-            redis::cmd("rsp.bind").arg("la").query(&mut con)?;
+            println!("Test #5");
+            // Bind a list to a plot, plot to key
+            redis::cmd("rsp.bind")
+                .arg("--list")
+                .arg("la")
+                .arg("--target")
+                .arg("key:la_output")
+                .query(&mut con)?;
+
+            // Push a few data on an existing list
+            con.rpush("la", vec![4u32, 8, 15, 16, 23, 42])?;
+
+            // Check if output is as expected
+            //TODO questo lo devo fare: scrivere la key in uscita con --target key:foo
+            //e leggere qui il risultato, che non si sa quando sarà pronto...
+            // la lettura async si dovrebbe poter fare usando le redis keyspace notifications
         }
 
         Ok(())

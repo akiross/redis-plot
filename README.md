@@ -19,6 +19,21 @@ $ redis-cli
 > rsp.draw
 ```
 
+## Testing
+
+To perform integration testing it is necessary to build the cdylib somewhere and
+start redis-server using that module: this is done automatically by the tests in
+tests/integration.rs, but building will take some time to build both the library
+and the tests.
+During development, it might be useful to use the `REDIS_PLOT_TEST_TARGET_DIR`
+to specify where the cdylib shall be built: if unset, a safe, random temporary
+directory will be used for the build, but that variable can be set to force a
+directory to use, resulting in faster subsequent builts - thus more useful if
+needed to run the test several times.
+
+Use `cargo insta test` to perform the acceptance tests, possibly reviewing the
+outcome as instructed. Use `show_rle_snap` to inspect the snapshots.
+
 ## Future
 
 The tool is not meant to become super duper complex, use gnuplot for that.
@@ -77,7 +92,7 @@ Possible command syntaxes, pros/cons:
    - con: verbose?
    - con: role of spaces is unclear, might need decent parsing
  - keyword based with groups "command key1 val val key2 val val"
-   - pro: simple, ice on redis parsing
+   - pro: simple, nice on redis parsing
    - pro: not too verbose, but is also explicit
    - pro: order doesn't matter
    - pro: flexible

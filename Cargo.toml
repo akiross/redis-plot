@@ -18,9 +18,12 @@ cairo-rs = "0.15"
 gtk4 = "0.4"
 gio = "0.15"
 glib = "0.15"
+redis = "0.21"
+slint = "0.2.4"
+slint-interpreter = { version = "0.2.4", features = ["display-diagnostics"] }
+spin_on = "0.1.1"
 
 [dev-dependencies]
-redis = "0.21"
 anyhow = "1"
 tempfile = "3.3"
 insta = "1.14"

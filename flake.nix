@@ -73,7 +73,6 @@
             cargo
             clang
             fontconfig
-            #freetype
             glib
             gtk4
             libclang
@@ -87,6 +86,15 @@
           ];
           RUST_SRC_PATH = rustPlatform.rustLibSrc;
           LIBCLANG_PATH = "${libclang.lib}/lib";
+          APPEND_LIBRARY_PATH = with pkgs; lib.makeLibraryPath [
+            libGL
+            xorg.libXcursor
+            xorg.libXi
+            xorg.libXrandr
+          ];
+          shellHook = ''
+            export LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$APPEND_LIBRARY_PATH"
+          '';
         };
       });
 }

@@ -1,0 +1,32 @@
+import { VerticalBox, Button, Slider } from "std-widgets.slint";
+
+MainWindow := Window {
+    // The callbacks that the UI can use to send data to redis.
+    callback send_i32(string, int);
+    // callback send_f32(string, float);
+    // callback send_bool(string, bool);
+    // callback send_string(string, string);
+    callback rpush_i32(string, int);
+
+    // Whatever one wants
+    property <int> counter: 0;
+
+    VerticalBox {
+        button := Button {
+            text: "Press to increase foo";
+            clicked => {
+                counter += 1;
+                root.send_i32("ciccia", counter);
+            }
+        }
+
+        Slider {
+            minimum: -100;
+            maximum: 100;
+            value: 0;
+            changed(x) => {
+                root.rpush_i32("cicala", x);
+            }
+        }
+    }
+}

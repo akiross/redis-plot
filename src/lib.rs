@@ -19,12 +19,12 @@ use redis_module::{
 use gtk4::prelude::*;
 
 use plotters::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 mod utils;
 
-use utils::{build_ui, plot_stuff};
+use utils::{build_ui, plot_complex, PlotSpec};
 
 /*
 struct MyApplication {
@@ -61,16 +61,279 @@ lazy_static! {
 // TODO this must change (to a map?) and allow to send data to different targets, so
 // we can update different windows and/or images.
 static mut CHAN_TX: Option<glib::Sender<String>> = None;
+const COLORS: &[(u8, u8, u8)] = &[(0xff, 0x00, 0x00), (0x00, 0xff, 0x00), (0x00, 0x00, 0xff)];
 
 lazy_static! {
     static ref BOUND_L: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
+    //static ref CHAN_TX: Option<glib::Sender<String>> = None;
+    /*
+    qui devo decidere come gestire le cose:
+        una KEY può essere usata in più DrawParams, quindi dovremmo poter cercare
+        in BOUND_NAMES (o BOUND_KEYS) per chiave e ricostruire tutti i DrawParams
+        in cui figura. Non vorremmo avere dei DrawParams duplicati però: in BOUND_L
+        usiamo un HashSet, ma sono solo le singole chiavi, mentre qui abbiamo
+        DrawParams che non è Hash-able né Eq-able. Potremmo assumere che non possono
+        essere duplicabili i DrawParams e quindi mappare le keys a liste di DrawParams
+    */
+    // Maps redis keys to vectors of drawing parameters, which are later used for rendering.
+    // TODO the vec could become a list of indices/references into a vector of DrawParams
+    // to avoid duplicating the arguments.
+    static ref BOUND_KEYS: Mutex<HashMap<String, Vec<DrawParams>>> = Mutex::new(HashMap::new());
+    //static ref BOUND_NAMES: Mutex<HashMap<String, DrawParams>> = Mutex::new(HashSet::new());
+}
+
+/// Arguments are interpreted as a map with list of values. They are supposed
+/// to be specified like --foo 1 --bar --baz 2 3
+// Does it make sense to have HashMap::from(Vec<RedisString>)? This would allow
+// to parse arguments in different ways depending on the target type - possibly
+// changing the syntax in the future and being more flexible. TODO consider this.
+fn parse_args(args: Vec<String>) -> HashMap<String, Vec<String>> {
+    let mut p = HashMap::new();
+    let mut last_key = "".to_owned();
+    for a in args.into_iter() {
+        let a = a.to_string();
+        if a.starts_with("--") {
+            last_key = a;
+            p.entry(last_key.clone()).or_insert(vec![]);
+        } else {
+            p.entry(last_key.clone()).or_insert(vec![]).push(a);
+        }
+    }
+    p
+}
+
+#[test]
+fn test_parse_args() {
+    let target = {
+        let mut m = HashMap::new();
+        m.insert("--foo".to_owned(), vec!["1".to_owned(), "11".to_owned()]);
+        m.insert("--bar".to_owned(), vec![]);
+        m.insert("--baz".to_owned(), vec!["2".to_owned()]);
+        m
+    };
+
+    assert_eq!(
+        parse_args(
+            vec!["--foo", "1", "11", "--bar", "--baz", "2"]
+                .into_iter()
+                .map(|s| s.to_owned())
+                .collect()
+        ),
+        target
+    );
+
+    assert_eq!(
+        parse_args(
+            vec!["--foo", "1", "--foo", "11", "--baz", "2", "--bar"]
+                .into_iter()
+                .map(|s| s.to_owned())
+                .collect()
+        ),
+        target
+    );
+
+    assert_eq!(parse_args(vec![]), HashMap::new());
+}
+
+#[derive(Clone, Debug)]
+struct DrawParams {
+    lists: Vec<String>,
+    width: usize,
+    height: usize,
+}
+
+// TODO implement TryFrom for DrawParams, possibly dropping parse_args.
+/// Parse the arguments and return DrawParams.
+fn draw_params_try_from(args: Vec<RedisString>) -> Result<DrawParams, RedisError> {
+    // Parse the arguments into a map. Checks on arity will be performed later.
+    let args = parse_args(args.into_iter().map(|s| s.to_string()).collect());
+
+    // This command accept lists where to get data
+    let lists = args
+        .get("--list")
+        .ok_or(RedisError::Str("Missing mandatory --list argument"))?
+        .clone();
+
+    if lists.is_empty() {
+        return Err(RedisError::WrongArity);
+    }
+
+    Ok(DrawParams {
+        lists,
+        width: 400,
+        height: 300,
+    })
+}
+
+fn plot_spec_try_from(ctx: &Context, args: DrawParams) -> Result<PlotSpec, RedisError> {
+    let DrawParams {
+        lists,
+        width: _,
+        height: _,
+    } = args;
+
+    // Read all the data for all the lists
+    let mut ld = vec![];
+    for l in lists.into_iter() {
+        // Get the data for this list
+        let d = ctx.call("LRANGE", &[&l, "0", "-1"])?;
+
+        // Ensure it's an array and extract data from it.
+        if let RedisValue::Array(els) = d {
+            let data: Vec<(f32, f32)> = els
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, v)| match v {
+                    // Try to parse the string, return None (ignore value) on fail.
+                    RedisValue::SimpleString(v) => Some((i as f32, v.parse::<f32>().ok()?)),
+                    // Note we are using f32 for points, there might be loss of precision.
+                    RedisValue::Integer(v) => Some((i as f32, v as f32)),
+                    RedisValue::Float(v) => Some((i as f32, v as f32)),
+                    _ => None,
+                })
+                .collect();
+
+            // Get the data
+            ld.push(data);
+        } else {
+            return Err(RedisError::String(format!("{} is not an array", l)));
+        }
+    }
+
+    Ok(PlotSpec {
+        color: (0..ld.len()).map(|i| COLORS[i % COLORS.len()]).collect(),
+        data: ld,
+        bg_color: (0xff, 0xff, 0xff),
+    })
+}
+
+/// This is the primitive function for rsp: it takes all the arguments necessary
+/// to determine what to plot, where and how. Returns a (redis) string with the binary
+/// image with the plot.
+/// Arguments are passed using dashed notation, for example `--foo 1 2 3 --bar` is
+/// valid under this notation.
+/// Currently accepts a `--list key+` argument, followed by one or more redis keys
+/// containing a list of integers or floats.
+/// Color is currently fixed to cyclic-RGB for curves, same as output size of the image,
+/// grid, ticks and background colors.
+fn rsp_draw(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
+    // Parse arguments
+    let args = draw_params_try_from(args)?;
+    let w = args.width;
+    let h = args.height;
+
+    // Prepare the data for plotting
+    let sp = plot_spec_try_from(ctx, args)?;
+
+    // Plot the data on a buffer bitmap
+    // TODO read size from args.
+    let mut buf: Vec<u8> = vec![0; w * h * 3];
+    let root = BitMapBackend::with_buffer(&mut buf, (w as u32, h as u32)).into_drawing_area();
+
+    plot_complex(root, sp);
+
+    // Send back the data, prepending encoded width and height
+    Ok(w.to_be_bytes()
+        .into_iter()
+        .chain(h.to_be_bytes().into_iter())
+        .chain(buf.into_iter())
+        .collect::<Vec<u8>>()
+        .into())
 }
 
 /// Binds a list name to a plot. Whenever the list gets updated, after the binding,
-/// the plot will be updated. A single argument is needed, with the name of the list.
-// TODO in future, this will also accept a plot type (scatter, lines, histogram...)
-// and a drawing target (window, image).
+/// the plot will be updated. This accepts the same argument as rsp_draw.
+// The new rsp_bind parses the args immediately, stores the parsed struct.
+// On list event, the parsed struct will be used to read the data from redis
+// and plot it.
 fn rsp_bind(_: &Context, args: Vec<RedisString>) -> RedisResult {
+    let args = draw_params_try_from(args)?;
+
+    // Aggiungo un clone di args per ogni key che potrebbe essere aggiornata.
+    args.lists.iter().for_each(|k| {
+        BOUND_KEYS
+            .lock()
+            .unwrap()
+            .entry(k.to_string())
+            .or_insert(vec![])
+            .push(args.clone());
+    });
+
+    Ok(().into())
+}
+
+fn on_list_event(ctx: &Context, ev_type: NotifyEvent, event: &str, key: &str) -> RedisResult {
+    println!("Some list event! {:?} {} {}", ev_type, event, key);
+    // Check if the key that generated the event was bound to something.
+    if BOUND_KEYS.lock().unwrap().contains_key(key) {
+        println!("This key '{}' was watched, plotting!", key);
+        //////////////////////////////////////////////////////
+
+        // There might be multiple plots bound to this key
+        let binding_args = BOUND_KEYS.lock().unwrap().get(key).unwrap().clone();
+        for args in binding_args.into_iter() {
+            if false {
+                // Draw on image
+                let w = args.width;
+                let h = args.height;
+                let mut buf: Vec<u8> = vec![0; w * h * 3];
+                let root =
+                    BitMapBackend::with_buffer(&mut buf, (w as u32, h as u32)).into_drawing_area();
+
+                println!("Ok, root is ready, drawing...");
+
+                let sp = plot_spec_try_from(ctx, args)?;
+                plot_complex(root, sp);
+            } else {
+                // FIXME all the block is unsafe, not great...
+                unsafe {
+                    CHAN_TX.as_ref().map(|ch| ch.send(key.to_string()));
+                }
+            }
+        }
+        /*
+        //: Mutex<HashMap<String, Vec<DrawParams>>> = Mutex::new(HashMap::new());
+
+        // Parse arguments
+        //let args = draw_params_try_from(args)?;
+        // Plot the data on a buffer bitmap
+        // TODO read size from args.
+        let (w, h) = (400, 300);
+        let mut buf: Vec<u8> = vec![0; w * h * 3];
+        let root = BitMapBackend::with_buffer(&mut buf, (w as u32, h as u32)).into_drawing_area();
+
+        let args = BOUND_KEYS
+            .lock()
+            .unwrap()
+            .get(key)
+            .expect("I lost the key I just checked.");
+
+        for args in args.into_iter() {
+            // Prepare the data for plotting
+            let sp = plot_spec_try_from(ctx, *args)?;
+
+            plot_complex(root, sp);
+        }
+        */
+
+        // Send back the data, prepending encoded width and height
+        /*
+        return Ok(w
+            .to_be_bytes()
+            .into_iter()
+            .chain(h.to_be_bytes().into_iter())
+            .chain(buf.into_iter())
+            .collect::<Vec<u8>>()
+            .into());
+            */
+    }
+    Ok(().into())
+}
+
+/////////////////////////////////////////////////// Old
+
+/*
+fn rsp_bind_ooolld(_: &Context, args: Vec<RedisString>) -> RedisResult {
     if args.len() < 2 {
         return Err(RedisError::WrongArity);
     }
@@ -88,7 +351,12 @@ fn rsp_bind(_: &Context, args: Vec<RedisString>) -> RedisResult {
     Ok(().into())
 }
 
-fn on_list_event(ctx: &Context, ev_type: NotifyEvent, event: &str, key: &str) -> RedisResult {
+fn on_list_event_ooolld(
+    ctx: &Context,
+    ev_type: NotifyEvent,
+    event: &str,
+    key: &str,
+) -> RedisResult {
     println!("Some list event! {:?} {} {}", ev_type, event, key);
     if BOUND_L.lock().unwrap().contains(key) {
         // TODO redraw should happen only for the related plot
@@ -97,68 +365,7 @@ fn on_list_event(ctx: &Context, ev_type: NotifyEvent, event: &str, key: &str) ->
     }
     Ok(().into())
 }
-
-/// This is the primitive function for rsp: it takes all the arguments necessary
-/// to determine what to plot, where and how. The first argument is mandatory: it's
-/// the key name for a list, source of data.
-/// TODO The second argument is the kind of plot (e.g. "scatter"), this defaults to "scatter".
-/// TODO The third argument specified the draw target: a window name or a string, this defaults to "-" (string).
-fn rsp_draw(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
-    if args.len() < 2 {
-        return Err(RedisError::WrongArity);
-    }
-
-    // Parse arguments
-    let mut args = args.into_iter().skip(1);
-    let key = args.next().expect("BUG!").to_string();
-    //let kind = args.next().map_or("scatter".to_string(), |s| s.to_string());
-    //let target = args.next().map_or("-".to_string(), |s| s.to_string());
-
-    // Read the entire data (TODO there is likely a better way to do this)
-    let els = ctx
-        .call("LRANGE", &[key.as_str(), "0", "-1"])
-        .expect("Cannot lrange");
-
-    // println!("Collecting RSP {:?}", els);
-    if let RedisValue::Array(els) = els {
-        let data: Vec<(f32, f32)> = els
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, v)| match v {
-                // FIXME this unwrap shall be changed into a None
-                RedisValue::SimpleString(v) => Some((i as f32, v.parse::<f32>().unwrap())),
-                RedisValue::Integer(v) => Some((i as f32, v as f32)),
-                RedisValue::Float(v) => Some((i as f32, v as f32)),
-                _ => None,
-            })
-            .collect();
-
-        // Plot the data on a buffer bitmap
-        let (w, h) = (400, 300);
-        let mut buf: Vec<u8> = vec![0; w * h * 3];
-        let root = BitMapBackend::with_buffer(&mut buf, (w as u32, h as u32)).into_drawing_area();
-
-        plot_stuff(root, data);
-
-        // Send back the data, prepending encoded width and height
-        Ok(w.to_be_bytes()
-            .into_iter()
-            .chain(h.to_be_bytes().into_iter())
-            .chain(buf.into_iter())
-            .collect::<Vec<u8>>()
-            .into())
-    } else {
-        Err(RedisError::Str("Not an array"))
-    }
-
-    /*
-    //let tx = STATE.get_tx();
-    let tx = unsafe { CHAN_TX.clone() }.expect("TX end was None!");
-    dbg!(&tx);
-    tx.send(product.to_string()).expect("Cannot send");
-    println!("DATA SENT TO CHANNEL!");
-    */
-}
+*/
 
 /// This is an echo function used for testing
 fn rsp_echo(_: &Context, args: Vec<RedisString>) -> RedisResult {
@@ -193,6 +400,10 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
             app.connect_activate(|app| {
                 let tx = build_ui(app);
                 // Save the channel so we can send data to it
+                // SAFETY: FIXME, this *should* happen once, but it might not, since
+                // activate is a Fn; so, CHAN_TX might be set multiple times and
+                // the on_list_event might be writing on this. A mutex might be
+                // appropriate
                 unsafe {
                     CHAN_TX = Some(tx);
                 }
