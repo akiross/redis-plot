@@ -26,60 +26,19 @@ mod utils;
 
 use utils::{build_ui, plot_complex, PlotSpec};
 
-/*
-struct MyApplication {
-    tx: Option<glib::Sender<String>>,
-    rx: Option<glib::Receiver<String>>,
-    out_files: Vec<std::path::PathBuf>,
-}
-
-impl MyApplication {
-    fn new() -> Self {
-        MyApplication {
-            tx: None,
-            rx: None,
-            out_files: vec![],
-        }
-    }
-    /// Sets up a communication channel, returning RX.
-    fn build_chan(&mut self) -> glib::Receiver<String> {
-        let (tx, rx) = glib::MainContext::channel(PRIORITY_DEFAULT);
-        rx
-    }
-
-    unsafe fn get_tx(&self) -> glib::Sender<String> {
-        let (tx, rx) = glib::MainContext::channel(PRIORITY_DEFAULT);
-        tx
-    }
-}
-
-lazy_static! {
-    static ref STATE: MyApplication = MyApplication::new();
-}
-*/
-
 // TODO this must change (to a map?) and allow to send data to different targets, so
 // we can update different windows and/or images.
-static mut CHAN_TX: Option<glib::Sender<String>> = None;
+//static mut CHAN_TX: Option<glib::Sender<String>> = None;
 const COLORS: &[(u8, u8, u8)] = &[(0xff, 0x00, 0x00), (0x00, 0xff, 0x00), (0x00, 0x00, 0xff)];
 
 lazy_static! {
     static ref BOUND_L: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
-    //static ref CHAN_TX: Option<glib::Sender<String>> = None;
-    /*
-    qui devo decidere come gestire le cose:
-        una KEY può essere usata in più DrawParams, quindi dovremmo poter cercare
-        in BOUND_NAMES (o BOUND_KEYS) per chiave e ricostruire tutti i DrawParams
-        in cui figura. Non vorremmo avere dei DrawParams duplicati però: in BOUND_L
-        usiamo un HashSet, ma sono solo le singole chiavi, mentre qui abbiamo
-        DrawParams che non è Hash-able né Eq-able. Potremmo assumere che non possono
-        essere duplicabili i DrawParams e quindi mappare le keys a liste di DrawParams
-    */
     // Maps redis keys to vectors of drawing parameters, which are later used for rendering.
     // TODO the vec could become a list of indices/references into a vector of DrawParams
     // to avoid duplicating the arguments.
     static ref BOUND_KEYS: Mutex<HashMap<String, Vec<DrawParams>>> = Mutex::new(HashMap::new());
     //static ref BOUND_NAMES: Mutex<HashMap<String, DrawParams>> = Mutex::new(HashSet::new());
+    static ref WINDOWS_TX: Mutex<HashMap<String, glib::Sender<String>>> = Mutex::new(HashMap::new());
 }
 
 /// Arguments are interpreted as a map with list of values. They are supposed
@@ -267,7 +226,6 @@ fn on_list_event(ctx: &Context, ev_type: NotifyEvent, event: &str, key: &str) ->
     // Check if the key that generated the event was bound to something.
     if BOUND_KEYS.lock().unwrap().contains_key(key) {
         println!("This key '{}' was watched, plotting!", key);
-        //////////////////////////////////////////////////////
 
         // There might be multiple plots bound to this key
         let binding_args = BOUND_KEYS.lock().unwrap().get(key).unwrap().clone();
@@ -285,87 +243,23 @@ fn on_list_event(ctx: &Context, ev_type: NotifyEvent, event: &str, key: &str) ->
                 let sp = plot_spec_try_from(ctx, args)?;
                 plot_complex(root, sp);
             } else {
+                // Draw on window
+                // TODO use the args to select the target window
                 // FIXME all the block is unsafe, not great...
-                unsafe {
-                    CHAN_TX.as_ref().map(|ch| ch.send(key.to_string()));
-                }
+                WINDOWS_TX
+                    .lock()
+                    .unwrap()
+                    .get("window")
+                    .unwrap()
+                    .send(key.to_string());
+                //unsafe {
+                //    CHAN_TX.as_ref().map(|ch| ch.send(key.to_string()));
+                //}
             }
         }
-        /*
-        //: Mutex<HashMap<String, Vec<DrawParams>>> = Mutex::new(HashMap::new());
-
-        // Parse arguments
-        //let args = draw_params_try_from(args)?;
-        // Plot the data on a buffer bitmap
-        // TODO read size from args.
-        let (w, h) = (400, 300);
-        let mut buf: Vec<u8> = vec![0; w * h * 3];
-        let root = BitMapBackend::with_buffer(&mut buf, (w as u32, h as u32)).into_drawing_area();
-
-        let args = BOUND_KEYS
-            .lock()
-            .unwrap()
-            .get(key)
-            .expect("I lost the key I just checked.");
-
-        for args in args.into_iter() {
-            // Prepare the data for plotting
-            let sp = plot_spec_try_from(ctx, *args)?;
-
-            plot_complex(root, sp);
-        }
-        */
-
-        // Send back the data, prepending encoded width and height
-        /*
-        return Ok(w
-            .to_be_bytes()
-            .into_iter()
-            .chain(h.to_be_bytes().into_iter())
-            .chain(buf.into_iter())
-            .collect::<Vec<u8>>()
-            .into());
-            */
     }
     Ok(().into())
 }
-
-/////////////////////////////////////////////////// Old
-
-/*
-fn rsp_bind_ooolld(_: &Context, args: Vec<RedisString>) -> RedisResult {
-    if args.len() < 2 {
-        return Err(RedisError::WrongArity);
-    }
-
-    let list_name = args
-        .into_iter()
-        .skip(1)
-        .next_arg()
-        .expect("BUG, list_name arg was not counted properly");
-
-    // Bind the list name so we will watch it
-    BOUND_L.lock().unwrap().insert(list_name.to_string());
-    println!("List {} bound", list_name);
-
-    Ok(().into())
-}
-
-fn on_list_event_ooolld(
-    ctx: &Context,
-    ev_type: NotifyEvent,
-    event: &str,
-    key: &str,
-) -> RedisResult {
-    println!("Some list event! {:?} {} {}", ev_type, event, key);
-    if BOUND_L.lock().unwrap().contains(key) {
-        // TODO redraw should happen only for the related plot
-        println!("A watched list! Triggering redraw!");
-        return rsp_draw(ctx, vec![]); // FIXME pass arguments here?
-    }
-    Ok(().into())
-}
-*/
 
 /// This is an echo function used for testing
 fn rsp_echo(_: &Context, args: Vec<RedisString>) -> RedisResult {
@@ -404,9 +298,15 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
                 // activate is a Fn; so, CHAN_TX might be set multiple times and
                 // the on_list_event might be writing on this. A mutex might be
                 // appropriate
+                /*
                 unsafe {
                     CHAN_TX = Some(tx);
                 }
+                */
+
+                // let binding_args = BOUND_KEYS.lock().unwrap().get(key).unwrap().clone();
+                WINDOWS_TX.lock().unwrap().insert("window".to_string(), tx);
+                //: Mutex<HashMap<String, glib::Sender<String>>> = Mutex::new(HashMap::new());
             });
 
             app.run_with_args::<&str>(&[]);

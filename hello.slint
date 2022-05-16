@@ -1,22 +1,36 @@
-import { VerticalBox, Button, Slider } from "std-widgets.slint";
+import { VerticalBox, LineEdit, Button, Slider } from "std-widgets.slint";
+
 
 MainWindow := Window {
+    // This is the "API for this writer application.
+    // There is a family of callbacks to send data to redis, with name
+    // (set|lpush|rpush)_(i32|f32|bool|string) and arguments (string, value).
+    //
+    // Commands can be set with the cmd(string, [string]) callback.
+
     // The callbacks that the UI can use to send data to redis.
-    callback send_i32(string, int);
-    // callback send_f32(string, float);
-    // callback send_bool(string, bool);
-    // callback send_string(string, string);
+    callback set_i32(string, int);
+    // callback set_f32(string, float);
+    // callback set_bool(string, bool);
+    // callback set_string(string, string);
     callback rpush_i32(string, int);
+    callback cmd(string, [string]);
+
+    // With this, do whatever you want! :)
 
     // Whatever one wants
     property <int> counter: 0;
 
     VerticalBox {
+        variable := LineEdit {
+            placeholder-text: "Variable";
+        }
+
         button := Button {
-            text: "Press to increase foo";
+            text: "Press to bind to list " + variable.text;
             clicked => {
                 counter += 1;
-                root.send_i32("ciccia", counter);
+                root.cmd("rsp.bind", ["--list", variable.text]);
             }
         }
 
@@ -25,7 +39,7 @@ MainWindow := Window {
             maximum: 100;
             value: 0;
             changed(x) => {
-                root.rpush_i32("cicala", x);
+                root.rpush_i32(variable.text, x);
             }
         }
     }

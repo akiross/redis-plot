@@ -2,12 +2,13 @@
 /// It reads a .slint file with the GUI and automatically binds the values
 /// to functions that write the data on redis (write only!)
 use redis::Commands;
+use slint::Model;
 use slint_interpreter::{ComponentCompiler, ComponentHandle, SharedString, Value};
 use std::cell::RefCell;
-//use std::convert::TryFrom;
 use std::rc::Rc;
 
-// Wrapper, this is to use TryFrom until slint issue #1258 is fixed.
+// Wrapper, this wraps Value into something that has TryFrom (missing from slint 0.2.4 but
+// a patch has landed: waiting the next release to remove this, see slint issue #1258).
 #[derive(Clone)]
 struct Wrap(Value);
 
@@ -45,8 +46,6 @@ impl TryFrom<Wrap> for SharedString {
 fn make_set_callback<T>(con_clone: Rc<RefCell<redis::Connection>>) -> impl Fn(&[Value]) -> Value
 where
     T: redis::ToRedisArgs,
-    // slint_interpreter::Value: TryInto<T>,
-    // <slint_interpreter::Value as TryInto<T>>::Error: std::fmt::Debug,
     T: TryFrom<Wrap> + redis::ToRedisArgs,
     <T as TryFrom<Wrap>>::Error: std::fmt::Debug,
 {
@@ -87,8 +86,6 @@ fn make_set_callback_str(con_clone: Rc<RefCell<redis::Connection>>) -> impl Fn(&
 fn make_lpush_callback<T>(con_clone: Rc<RefCell<redis::Connection>>) -> impl Fn(&[Value]) -> Value
 where
     T: redis::ToRedisArgs,
-    // slint_interpreter::Value: TryInto<T>,
-    // <slint_interpreter::Value as TryInto<T>>::Error: std::fmt::Debug,
     T: TryFrom<Wrap> + redis::ToRedisArgs,
     <T as TryFrom<Wrap>>::Error: std::fmt::Debug,
 {
@@ -130,8 +127,6 @@ fn make_lpush_callback_str(
 fn make_rpush_callback<T>(con_clone: Rc<RefCell<redis::Connection>>) -> impl Fn(&[Value]) -> Value
 where
     T: redis::ToRedisArgs,
-    // slint_interpreter::Value: TryInto<T>,
-    // <slint_interpreter::Value as TryInto<T>>::Error: std::fmt::Debug,
     T: TryFrom<Wrap> + redis::ToRedisArgs,
     <T as TryFrom<Wrap>>::Error: std::fmt::Debug,
 {
@@ -180,7 +175,7 @@ fn main() {
     if let Some(definition) = definition {
         let instance = definition.create();
 
-        // Prepare redis connection, which will be
+        // Prepare redis connection
         let client = redis::Client::open("redis://127.0.0.1/").expect("Cannot connect to server");
         // Redis connection cannot be cloned, so we could create a new connection
         // for each callback execution, but it's cumbersome.
@@ -188,20 +183,33 @@ fn main() {
             client.get_connection().expect("Cannot get connection"),
         ));
 
-        // let instance_weak = instance.as_weak();
-        // let count = instance_weak.unwrap().get_property("counter").unwrap();
-        // let count: u32 = count.try_into().unwrap();
-        // println!("Pulsante aggiornato: {:?}", count);
-
-        //let val = i32::try_from(args[1].clone()).expect("Not an i32");
-        /*
-        let val: i32 = args[1]
-            .clone()
-            .try_into()
-            .expect("Second argument not an i32");
-        */
-
         // Set callbacks for possible actions
+        let con_clone = con.clone();
+        instance
+            .set_callback("cmd", move |args: &[Value]| -> Value {
+                // The name of the command is a SharedString
+                let cmd_name: SharedString = args[0].clone().try_into().expect("Not a string");
+                // The arguments is a Model<SharedString>, there is no TryFrom for it, so we
+                // have to iterate the model and convert each element.
+                let cmd_args: Vec<SharedString> = if let Value::Model(modelrc) = args[1].clone() {
+                    modelrc
+                        .iter()
+                        .map(|x| -> SharedString { x.clone().try_into().expect("Not a shastring") })
+                        .collect()
+                } else {
+                    panic!("not a model!");
+                };
+
+                let mut con = con_clone.borrow_mut();
+                redis::cmd(cmd_name.as_str())
+                    .arg(cmd_args.iter().map(|a| a.as_str()).collect::<Vec<_>>())
+                    .query::<()>(&mut *con)
+                    .expect("Cannot set");
+
+                Value::from(())
+            })
+            .unwrap_or_else(|_| println!("No set_i32 callback, ignoring"));
+
         instance
             .set_callback("set_i32", make_set_callback::<i32>(con.clone()))
             .unwrap_or_else(|_| println!("No set_i32 callback, ignoring"));
