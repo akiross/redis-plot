@@ -72,6 +72,7 @@
           buildInputs = [
             cargo
             clang
+            delta
             fontconfig
             glib
             gtk4

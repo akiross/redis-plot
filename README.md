@@ -1,8 +1,13 @@
 # redis-plot module
 
-This is a simple module that uses redis to collect data and plot them on screen.
+This is a redis module that collect data from keys and plot them on screen.
 
-For now it's simple and stupid: plots a single curve reading it from a list.
+For now it's simple, stupid and dirty (as in: the code is a mess): it allows
+to plot one or more lists as lines onto a window (or a buffer), but it's usable
+for simple tasks.
+
+There are a few automated tests, but they only check the routines plotting to
+string. There is no automated tests involving the windowing part.
 
 ## Usage
 
@@ -11,13 +16,29 @@ $ cargo build
 $ redis-server --loadmodule path/to/libredis_plot.so
 ```
 
-then
+starting redis-server with this module will open a window where the plotting
+happens. You can close it, but there's currently no way to open it again.
+
+Then, you can plot like this
 
 ```
 $ redis-cli
-> rpush rsp 1 4 9 16 25
-> rsp.draw
+> rsp.bind --list my_data
+> rpush my_data 1 4 9 16 25
 ```
+
+`rsp.bind` binds `my_data` to the plotting window: whenever the `my_data` list
+is updated, the plot is updated as well. Only lists are supported right now.
+
+If you have your backend and want to get the plotting somewhere different from
+that simple window, you can use
+
+```
+> rpush my_data 1 2 3 4 5
+> rsp.draw --list my_data
+```
+
+this will return a RGB buffer with the plot; the resolution is fixed right now.
 
 ## Testing
 
@@ -64,39 +85,13 @@ API will be something like this
 
 ### Command syntax
 
-The commands shall support
+Command syntax currently adopted looks like this:
 
- - different data sources (one or more lists, possibly streams)
- - different plot kinds (scatter, lines, bars, histograms)
- - different render targets (window, file, byte strings)
- - immediate/bind modes
- - plot options (colors, sizes, labels, legends...)
+```
+> rsp.command --foo foo1 foo2 --bar --baz baz1 --foo foo3
+```
 
-Given these premises, commands shall be designed in a way which is
-
-1. clear to understand, using a simple, consistent scheme;
-2. covenient to use, by not being too verbose;
-3. easy on the memory, being "natural" (principle of least suprise);
-4. adequate for redis, which has some bias on commands and parsing.
-
-Possible command syntaxes, pros/cons:
- - gnuplot-like
-   - pro: it exists already, might be easy to scrape
-   - pro: users familiar with gnuplot are in advantage
-   - con: familiar users might be surprised by missing features
-   - con: not very clear and definitely not simple
-   - con: not easy on memory
- - keyword based "command key1=val key2=val"
-   - pro: conceptually simple, easy to remember
-   - pro: flexible, order doesn't matter, very clear what is set
-   - con: verbose?
-   - con: role of spaces is unclear, might need decent parsing
- - keyword based with groups "command key1 val val key2 val val"
-   - pro: simple, nice on redis parsing
-   - pro: not too verbose, but is also explicit
-   - pro: order doesn't matter
-   - pro: flexible
-   - con: unclear role of repeating keys `k1 v1 v2 k2 v3 k1 v4`
- - positional "command val1 val2 val3 ..."
-   - pro: very simple, shell-like, nice on redis parsing
-   - con: not very flexible, depends on position only
+I am not sure this is the best choice, but looks decent for this use case and
+it is familiar for people using unix CLI tools. Given the tool will likely stay
+small for a while, this might be enough to specify input data sources, colors,
+output targets and plot styles (most of which is not implemented yet).
