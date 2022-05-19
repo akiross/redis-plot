@@ -14,6 +14,7 @@ extern crate redis_module;
 #[macro_use]
 extern crate lazy_static;
 
+use redis_module::ThreadSafeContext;
 use redis_module::{
     Context, LogLevel, NotifyEvent, RedisError, RedisResult, RedisString, RedisValue, Status,
 };
@@ -61,7 +62,7 @@ struct DrawParams {
 
 /// Logs a message, since ctx.log seems to have stopped working, I'm using println.
 fn log_msg(ctx: &Context, level: LogLevel, message: &str) {
-    println!("{}", message);
+    println!("(REDIS_PLOT) {}", message);
     ctx.log(level, message);
 }
 
@@ -240,6 +241,16 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
                     if let Some(app) = app.upgrade() {
                         // Stop holding the app
                         app.release();
+                        // FIXME the lock() method below seems to stall.
+                        // Send message
+                        // let thread_ctx = ThreadSafeContext::new();
+                        // println!("Locking...");
+                        // let ctx = thread_ctx.lock();
+                        // println!("Locked!");
+                        // log_msg(&ctx, LogLevel::Warning, "Application released");
+                        // println!("Done writing");
+                    } else {
+                        println!("Cannot upgrade application!");
                     }
                     Continue(true)
                 }
@@ -248,10 +259,14 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
 
             // Debug some events
             app.connect_window_added(|_, _| {
-                println!("Window added to application");
+                let thread_ctx = ThreadSafeContext::new();
+                let ctx = thread_ctx.lock();
+                log_msg(&ctx, LogLevel::Debug, "Window added to application");
             });
             app.connect_window_removed(|_, _| {
-                println!("Window removed from application");
+                let thread_ctx = ThreadSafeContext::new();
+                let ctx = thread_ctx.lock();
+                log_msg(&ctx, LogLevel::Debug, "Window removed from application");
             });
 
             // TODO support async render on files, not just windows.
@@ -307,11 +322,12 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
 
                                         // Get access to redis data
                                         // TODO there should be a more efficient access method.
-                                        use redis_module::ThreadSafeContext;
                                         let thread_ctx = ThreadSafeContext::new();
 
                                         let mut data = {
+                                            println!("DATA-CTX locking...");
                                             let ctx = thread_ctx.lock();
+                                            println!("DATA-CTX locked!");
 
                                             let els = ctx
                                                 .call("LRANGE", &[&list_key, "0", "-1"])
@@ -341,6 +357,7 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
                                                 vec![]
                                             }
                                         };
+                                        println!("DATA-CTX unlocked");
 
                                         plot_model.borrow_mut().clear();
                                         plot_model.borrow_mut().append(&mut data);
@@ -401,6 +418,7 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
 fn deinit_rsp(ctx: &Context) -> Status {
     log_msg(ctx, LogLevel::Notice, "De-initializing redis_plot");
     if let Some(tx) = APP_QUIT.lock().expect("Cannot lock").as_ref() {
+        log_msg(ctx, LogLevel::Debug, "Sending term signal...");
         tx.send(()).expect("Cannot send term signal");
     }
     Status::Ok
