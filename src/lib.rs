@@ -5,6 +5,33 @@
 /// The module can plot directly over a buffer as a RGB image - which can be read from the
 /// redis client and displayed as preferred - or output to a device (i.e. screen or file).
 
+/*
+sono in una situazione del cavolo: in nuova_lib.rs c'era l'implementazione che avevo fatto
+in cui si prendono gli args e li si manda nel chan, che costruisce la finestra secondo
+quelle specifiche e si registrano le chiavi associate...
+però non funziona. d'altro canto, tornando indietro nelle modifiche, mi sono accorto
+che questo file funziona, il motivo è che qui c'é la finestra che viene aperta dall'inizio:
+se la tolgo, non se ne aprono più. sembra quasi che sia un problema di app che viene
+distrutta, ma non è così (o almeno non sembra) perché comunque app::run viene eseguito
+e in teoria l'app rimane sempre in scope, quindi il weak pointer dovrebbe sempre
+essere valido - solo che non lo sappiamo perché - se tolgo la finestra magica -
+quando invio i dati al canale, essi non arrivano mai
+// TODO build a map plot-type -> series-name -> data
+// Get all keys supported by this
+// TODO vedere https://github.com/RedisLabsModules/redismodule-rs/blob/master/examples/lists.rs
+//   per un esempio di come aprire le chiavi e vederne il tipo e agire direttamente
+//   su di esse
+// if let Ok(RedisValue::Array(keys)) = ctx.call("KEYS", &["rsp-plot*"]) {
+//     for key in keys.iter() {
+//         match key {
+//             RedisValue::SimpleString(s) => println!("Key: {}", s),
+//             RedisValue::SimpleStringStatic(s) => println!("Key: {}", s),
+//             _ => {}
+//         }
+//     }
+// }
+*/
+
 #[macro_use]
 extern crate redis_module;
 
@@ -38,14 +65,14 @@ lazy_static! {
     // Maps redis keys to vectors of drawing parameters, which are later used for rendering.
     // TODO the vec could become a list of indices/references into a vector of DrawParams
     // to avoid duplicating the arguments.
-    static ref BOUND_KEYS: Mutex<HashMap<String, Vec<DrawParams>>> = Mutex::new(HashMap::new());
+    static ref BOUND_KEYS: Mutex<HashMap<String, Vec<glib::Sender<String>>>> = Mutex::new(HashMap::new());
     //static ref BOUND_NAMES: Mutex<HashMap<String, DrawParams>> = Mutex::new(HashSet::new());
-    static ref WINDOWS_TX: Mutex<HashMap<String, glib::Sender<String>>> = Mutex::new(HashMap::new());
+    // static ref WINDOWS_TX: Mutex<HashMap<String, glib::Sender<String>>> = Mutex::new(HashMap::new());
 
 
     // Questo è il canale tramite cui si mandano le cose al dispatcher. Viene usato
     // da rsp.bind per istruire la GUI che vogliamo un nuovo target di rendering.
-    static ref DISPATCHER_TX: Mutex<Option<glib::Sender<String>>> = Mutex::new(None);
+    static ref DISPATCHER_TX: Mutex<Option<glib::Sender<DrawParams>>> = Mutex::new(None);
 }
 
 #[derive(Clone, Debug)]
@@ -168,10 +195,11 @@ fn rsp_bind(_: &Context, args: Vec<RedisString>) -> RedisResult {
     // Quando avviene il bind, mandiamo un messaggio con le specifiche al
     // dispatcher
     if let Some(tx) = DISPATCHER_TX.lock().expect("LOCK FALLITO").as_ref() {
-        tx.send(args.target.clone()).expect("SEND FALLITOH");
+        tx.send(args.clone()).expect("SEND FALLITOH");
     }
 
     // Aggiungo un clone di args per ogni key che potrebbe essere aggiornata.
+    /*
     args.lists.iter().for_each(|k| {
         BOUND_KEYS
             .lock()
@@ -180,6 +208,7 @@ fn rsp_bind(_: &Context, args: Vec<RedisString>) -> RedisResult {
             .or_insert(vec![])
             .push(args.clone());
     });
+    */
 
     Ok(().into())
 }
@@ -192,7 +221,9 @@ fn on_list_event(ctx: &Context, ev_type: NotifyEvent, event: &str, key: &str) ->
 
         // There might be multiple plots bound to this key
         let binding_args = BOUND_KEYS.lock().unwrap().get(key).unwrap().clone();
-        for args in binding_args.into_iter() {
+        for tx in binding_args.into_iter() {
+            tx.send(key.to_string()).expect("Cannot send key");
+            /*
             if false {
                 // Draw on image
                 let w = args.width;
@@ -219,6 +250,7 @@ fn on_list_event(ctx: &Context, ev_type: NotifyEvent, event: &str, key: &str) ->
                 //    CHAN_TX.as_ref().map(|ch| ch.send(key.to_string()));
                 //}
             }
+            */
         }
     }
     Ok(().into())
@@ -256,58 +288,60 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
             // Activation might be called multiple times, e.g. after being hidden
             app.connect_activate(|app| {
                 // costruisci il dispatcher
-                let tx_dispa = {
+                let bind_tx = {
                     use glib::clone;
                     use glib::{source::PRIORITY_DEFAULT, MainContext};
                     // Setup communication channel, this is unique for the UI being built.
                     let (tx, rx) = MainContext::channel(PRIORITY_DEFAULT);
                     rx.attach(None, {
                         let app_clone = app.downgrade();
-                        move |message: String| {
-                            println!("RICEVUTI DATI: {}", message);
+                        move |args: DrawParams| {
+                            println!("RICEVUTI DATI: {:?}", args);
 
                             if let Some(app) = app_clone.upgrade() {
                                 use std::cell::RefCell;
                                 use std::rc::Rc;
 
-                                let plot_spec: Rc<RefCell<Option<String>>> =
-                                    Rc::new(RefCell::new(None));
+                                let plot_spec: Rc<RefCell<Vec<(f32, f32)>>> =
+                                    Rc::new(RefCell::new(vec![]));
 
                                 let plot_spec_clone = plot_spec.clone();
                                 let drawing_area = gtk4::DrawingArea::new();
 
                                 drawing_area.set_draw_func(move |_, cr, w, h| {
                                     use plotters::prelude::*;
-                                    use redis_module::ThreadSafeContext;
+                                    //use redis_module::ThreadSafeContext;
 
                                     let root =
                                         plotters_cairo::CairoBackend::new(cr, (w as u32, h as u32))
                                             .into_drawing_area();
 
-                                    // Get access to redis data
-                                    let thread_ctx = ThreadSafeContext::new();
+                                    let data = plot_spec_clone.borrow().to_vec();
+                                    println!("Ora plotto!");
+                                    plot_stuff(root, data);
+                                });
 
-                                    let data = {
-                                        let ctx = thread_ctx.lock();
-                                        // TODO build a map plot-type -> series-name -> data
-                                        // Get all keys supported by this
-                                        // TODO vedere https://github.com/RedisLabsModules/redismodule-rs/blob/master/examples/lists.rs
-                                        //   per un esempio di come aprire le chiavi e vederne il tipo e agire direttamente
-                                        //   su di esse
-                                        // if let Ok(RedisValue::Array(keys)) = ctx.call("KEYS", &["rsp-plot*"]) {
-                                        //     for key in keys.iter() {
-                                        //         match key {
-                                        //             RedisValue::SimpleString(s) => println!("Key: {}", s),
-                                        //             RedisValue::SimpleStringStatic(s) => println!("Key: {}", s),
-                                        //             _ => {}
-                                        //         }
-                                        //     }
-                                        // }
+                                // let list_box = gtk4::ListBox::new();
+                                // list_box.append(&gtk4::Label::new(Some("999".into())));
 
-                                        if let Some(spec) = plot_spec_clone.borrow().as_deref() {
-                                            println!("Disegno usando la spec {}", spec);
+                                // Setup communication channel, this is unique for the UI being built.
+                                let (plot_tx, plot_rx) = MainContext::channel(PRIORITY_DEFAULT);
+                                plot_rx.attach(None, {
+                                    let drawing_area = drawing_area.downgrade();
+                                    move |list_key: String| {
+                                        println!("LIST KEY received: {}", list_key);
+
+                                        // Get access to redis data
+                                        use redis_module::ThreadSafeContext;
+                                        let thread_ctx = ThreadSafeContext::new();
+
+                                        let mut data = {
+                                            let ctx = thread_ctx.lock();
+
+                                            // if let Some(spec) = plot_spec_clone.borrow().as_deref() {
+                                            println!("Disegno usando la spec {}", list_key);
                                             let els = ctx
-                                                .call("LRANGE", &[spec, "0", "-1"])
+                                                .call("LRANGE", &[&list_key, "0", "-1"])
                                                 .expect("Cannot lrange");
                                             // println!("Collecting RSP {:?}", els);
                                             if let RedisValue::Array(els) = els {
@@ -331,46 +365,26 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
                                                     .collect();
                                                 data
                                             } else {
-                                                // println!("No rsp list found");
+                                                // list_key was not found!
                                                 vec![]
                                             }
-                                        } else {
-                                            // println!("No spec found");
-                                            vec![]
+                                        };
+
+                                        plot_spec.borrow_mut().clear();
+                                        plot_spec.borrow_mut().append(&mut data);
+
+                                        if let Some(drawing_area) = drawing_area.upgrade() {
+                                            drawing_area.queue_draw();
                                         }
-                                    };
-                                    // println!("Collected data {:?}", data);
-
-                                    println!("Ora plotto!");
-                                    plot_stuff(root, data);
-                                });
-
-                                // let list_box = gtk4::ListBox::new();
-                                // list_box.append(&gtk4::Label::new(Some("999".into())));
-
-                                // Setup communication channel, this is unique for the UI being built.
-                                let (plot_tx, plot_rx) = MainContext::channel(PRIORITY_DEFAULT);
-                                plot_rx.attach(
-                                    None,
-                                    clone!(@weak drawing_area => @default-return Continue(false),
-                                    move |message| {
-                                        println!("DATA RECEIVED: {}", message);
-                                        // let label = gtk4::Label::new(Some(&message));
-                                        // list_box.append(&label);
-                                        //
-                                        // Quando arriva una nuova spec (stringa per ora) la si salva per l'uso
-                                        plot_spec.replace(Some(message));
-
-                                        drawing_area.queue_draw();
                                         Continue(true)
-                                    }),
-                                );
+                                    }
+                                });
 
                                 let win = gtk4::Window::builder()
                                     .application(&app)
                                     .default_width(400)
                                     .default_height(300)
-                                    .title(message.as_str())
+                                    .title(args.target.as_str())
                                     .child(&drawing_area)
                                     .build();
 
@@ -379,8 +393,18 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
                                 // i dati ed eventualmente aprirle a comando
                                 win.present();
 
+                                args.lists.iter().for_each(|k| {
+                                    BOUND_KEYS
+                                        .lock()
+                                        .unwrap()
+                                        .entry(k.to_string())
+                                        .or_insert(vec![])
+                                        .push(plot_tx.clone());
+                                });
+
                                 // Salva plot_tx da qualche parte per quando
                                 // arrivano i dati da plottare
+                                // TODO questa potrebbe essere come su nuova_lib.rs
                             }
 
                             // let label = gtk4::Label::new(Some(&message));
@@ -410,11 +434,20 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
                     tx
                 };
 
-                //let tx_dispa = costruisci_dispatcher(app);
                 // Salvalo da qualche parte
-                let _ = DISPATCHER_TX.lock().expect("LOCK FALLITO").insert(tx_dispa);
+                let _ = DISPATCHER_TX.lock().expect("LOCK FALLITO").insert(bind_tx);
 
-                let tx = build_ui(app);
+                // questa cosa è assurda: se tolgo questa finestra, allora non riesco
+                // più ad aprire quelle successive
+                let win = gtk4::Window::builder()
+                    .application(app)
+                    .default_width(400)
+                    .default_height(300)
+                    .title("Boh")
+                    .build();
+                win.present();
+
+                // let tx = build_ui(app);
                 // Save the channel so we can send data to it
                 // SAFETY: FIXME, this *should* happen once, but it might not, since
                 // activate is a Fn; so, CHAN_TX might be set multiple times and
@@ -427,7 +460,7 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
                 */
 
                 // let binding_args = BOUND_KEYS.lock().unwrap().get(key).unwrap().clone();
-                WINDOWS_TX.lock().unwrap().insert("window".to_string(), tx);
+                // WINDOWS_TX.lock().unwrap().insert("window".to_string(), tx);
                 //: Mutex<HashMap<String, glib::Sender<String>>> = Mutex::new(HashMap::new());
             });
 
