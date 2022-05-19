@@ -4,33 +4,9 @@
 ///
 /// The module can plot directly over a buffer as a RGB image - which can be read from the
 /// redis client and displayed as preferred - or output to a device (i.e. screen or file).
-
-/*
-sono in una situazione del cavolo: in nuova_lib.rs c'era l'implementazione che avevo fatto
-in cui si prendono gli args e li si manda nel chan, che costruisce la finestra secondo
-quelle specifiche e si registrano le chiavi associate...
-però non funziona. d'altro canto, tornando indietro nelle modifiche, mi sono accorto
-che questo file funziona, il motivo è che qui c'é la finestra che viene aperta dall'inizio:
-se la tolgo, non se ne aprono più. sembra quasi che sia un problema di app che viene
-distrutta, ma non è così (o almeno non sembra) perché comunque app::run viene eseguito
-e in teoria l'app rimane sempre in scope, quindi il weak pointer dovrebbe sempre
-essere valido - solo che non lo sappiamo perché - se tolgo la finestra magica -
-quando invio i dati al canale, essi non arrivano mai
-// TODO build a map plot-type -> series-name -> data
-// Get all keys supported by this
-// TODO vedere https://github.com/RedisLabsModules/redismodule-rs/blob/master/examples/lists.rs
-//   per un esempio di come aprire le chiavi e vederne il tipo e agire direttamente
-//   su di esse
-// if let Ok(RedisValue::Array(keys)) = ctx.call("KEYS", &["rsp-plot*"]) {
-//     for key in keys.iter() {
-//         match key {
-//             RedisValue::SimpleString(s) => println!("Key: {}", s),
-//             RedisValue::SimpleStringStatic(s) => println!("Key: {}", s),
-//             _ => {}
-//         }
-//     }
-// }
-*/
+//
+// TODO look at https://github.com/RedisLabsModules/redismodule-rs/blob/master/examples/lists.rs
+// for a more efficient access to key data.
 
 #[macro_use]
 extern crate redis_module;
@@ -39,14 +15,13 @@ extern crate redis_module;
 extern crate lazy_static;
 
 use redis_module::{
-    Context, LogLevel, NextArg, NotifyEvent, RedisError, RedisResult, RedisString, RedisValue,
-    Status,
+    Context, LogLevel, NotifyEvent, RedisError, RedisResult, RedisString, RedisValue, Status,
 };
 
 use gtk4::prelude::*;
 
 use plotters::prelude::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 mod argparse;
@@ -67,6 +42,9 @@ lazy_static! {
     // is available. When an event happens for a given key, the key name shall be sent
     // over its channel: the dispatcher will read that key and update the plot.
     static ref BOUND_KEYS: Mutex<HashMap<String, Vec<glib::Sender<String>>>> = Mutex::new(HashMap::new());
+
+    // This is a channel that is used to signal when the app shall terminate.
+    static ref APP_QUIT: Mutex<Option<glib::Sender<()>>> = Mutex::new(None);
 }
 
 #[derive(Clone, Debug)]
@@ -76,7 +54,15 @@ struct DrawParams {
     height: usize,
     target: String,
     /// Shall the window be opened upon binding
+    // FIXME pick a better name: the choice is either present it once or on update
+    // FIXME it actually might be two separated options...
     open: bool,
+}
+
+/// Logs a message, since ctx.log seems to have stopped working, I'm using println.
+fn log_msg(ctx: &Context, level: LogLevel, message: &str) {
+    println!("{}", message);
+    ctx.log(level, message);
 }
 
 // TODO implement TryFrom for DrawParams, possibly dropping parse_args.
@@ -231,21 +217,48 @@ fn rsp_echo(_: &Context, args: Vec<RedisString>) -> RedisResult {
 }
 
 fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
+    log_msg(ctx, LogLevel::Warning, "Initializing rsp....");
+
     if args.len() == 1 {
-        ctx.log(LogLevel::Notice, "Plotting to file");
+        log_msg(ctx, LogLevel::Notice, "Plotting to file");
     } else {
         // println!("LOADING MODULE WITH ARGS {:?}", _args);
         std::thread::spawn(|| {
+            use glib::{source::PRIORITY_DEFAULT, MainContext};
+
             let app = gtk4::Application::builder()
                 .application_id("re.ale.RedisPlot")
                 .build();
+
+            // The app will be held until a termination signal arrives, so we can have it
+            // running even when there are no windows
+            app.hold();
+            let (app_tx, app_rx) = MainContext::channel(PRIORITY_DEFAULT);
+            app_rx.attach(None, {
+                let app = app.downgrade();
+                move |_| {
+                    if let Some(app) = app.upgrade() {
+                        // Stop holding the app
+                        app.release();
+                    }
+                    Continue(true)
+                }
+            });
+            let _ = APP_QUIT.lock().expect("Cannot lock").insert(app_tx);
+
+            // Debug some events
+            app.connect_window_added(|_, _| {
+                println!("Window added to application");
+            });
+            app.connect_window_removed(|_, _| {
+                println!("Window removed from application");
+            });
 
             // TODO support async render on files, not just windows.
 
             // Activation might be called multiple times, e.g. after being hidden
             app.connect_activate(|app| {
                 let bind_tx = {
-                    use glib::{source::PRIORITY_DEFAULT, MainContext};
                     // Setup communication channel, this is unique for the UI being built.
                     let (tx, rx) = MainContext::channel(PRIORITY_DEFAULT);
                     rx.attach(None, {
@@ -266,6 +279,7 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
                                     .application(&app)
                                     .default_width(args.width as i32)
                                     .default_height(args.height as i32)
+                                    .hide_on_close(true) // To open it on render
                                     .title(args.target.as_str())
                                     .child(&drawing_area)
                                     .build();
@@ -373,30 +387,22 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
                 };
 
                 // Salvalo da qualche parte
-                let _ = DISPATCHER_TX.lock().expect("LOCK FALLITO").insert(bind_tx);
-
-                // FIXME if this win gets commented out, no windows will appear at all.
-                // This suggests me that references get lost and weak pointers cannot
-                // upgrade.
-                let win = gtk4::Window::builder()
-                    .application(app)
-                    .default_width(400)
-                    .default_height(300)
-                    .title("Boh")
-                    .build();
-                win.present();
+                let _ = DISPATCHER_TX.lock().expect("Cannot lock").insert(bind_tx);
             });
 
             app.run_with_args::<&str>(&[]);
         });
     }
 
-    ctx.log(LogLevel::Warning, "Initializing rsp!");
+    log_msg(ctx, LogLevel::Notice, "redis_plot initialized");
     Status::Ok
 }
 
 fn deinit_rsp(ctx: &Context) -> Status {
-    ctx.log(LogLevel::Warning, "DE-initializing rsp!");
+    log_msg(ctx, LogLevel::Notice, "De-initializing redis_plot");
+    if let Some(tx) = APP_QUIT.lock().expect("Cannot lock").as_ref() {
+        tx.send(()).expect("Cannot send term signal");
+    }
     Status::Ok
 }
 
