@@ -55,24 +55,18 @@ mod utils;
 use argparse::parse_args;
 use utils::{build_ui, plot_complex, plot_stuff, PlotSpec};
 
-// TODO this must change (to a map?) and allow to send data to different targets, so
-// we can update different windows and/or images.
-//static mut CHAN_TX: Option<glib::Sender<String>> = None;
 const COLORS: &[(u8, u8, u8)] = &[(0xff, 0x00, 0x00), (0x00, 0xff, 0x00), (0x00, 0x00, 0xff)];
 
 lazy_static! {
-    static ref BOUND_L: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
-    // Maps redis keys to vectors of drawing parameters, which are later used for rendering.
-    // TODO the vec could become a list of indices/references into a vector of DrawParams
-    // to avoid duplicating the arguments.
-    static ref BOUND_KEYS: Mutex<HashMap<String, Vec<glib::Sender<String>>>> = Mutex::new(HashMap::new());
-    //static ref BOUND_NAMES: Mutex<HashMap<String, DrawParams>> = Mutex::new(HashSet::new());
-    // static ref WINDOWS_TX: Mutex<HashMap<String, glib::Sender<String>>> = Mutex::new(HashMap::new());
-
-
-    // Questo è il canale tramite cui si mandano le cose al dispatcher. Viene usato
-    // da rsp.bind per istruire la GUI che vogliamo un nuovo target di rendering.
+    // This is the channel to send drawing arguments to the dispatcher when a binding
+    // command arrives, the dispatcher will set up the window and build a channel to
+    // notify when keys are updated. That channel will be added in BOUND_KEYS.
     static ref DISPATCHER_TX: Mutex<Option<glib::Sender<DrawParams>>> = Mutex::new(None);
+
+    // Maps redis keys to channels that are used to notify the dispatcher when new data
+    // is available. When an event happens for a given key, the key name shall be sent
+    // over its channel: the dispatcher will read that key and update the plot.
+    static ref BOUND_KEYS: Mutex<HashMap<String, Vec<glib::Sender<String>>>> = Mutex::new(HashMap::new());
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +75,8 @@ struct DrawParams {
     width: usize,
     height: usize,
     target: String,
+    /// Shall the window be opened upon binding
+    open: bool,
 }
 
 // TODO implement TryFrom for DrawParams, possibly dropping parse_args.
@@ -104,6 +100,7 @@ fn draw_params_try_from(args: Vec<RedisString>) -> Result<DrawParams, RedisError
         width: 400,
         height: 300,
         target: "out_win".to_string(),
+        open: false,
     })
 }
 
@@ -113,6 +110,7 @@ fn plot_spec_try_from(ctx: &Context, args: DrawParams) -> Result<PlotSpec, Redis
         width: _,
         height: _,
         target: _,
+        open: _,
     } = args;
 
     // Read all the data for all the lists
@@ -184,36 +182,25 @@ fn rsp_draw(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
         .into())
 }
 
-/// Binds a list name to a plot. Whenever the list gets updated, after the binding,
-/// the plot will be updated. This accepts the same argument as rsp_draw.
-// The new rsp_bind parses the args immediately, stores the parsed struct.
-// On list event, the parsed struct will be used to read the data from redis
-// and plot it.
-fn rsp_bind(_: &Context, args: Vec<RedisString>) -> RedisResult {
+/// Binds one or more list keys to a new plot window. Whenever the keys get updated
+/// after the binding, the plot will be updated as well. This accepts the same arguments
+/// as rsp_draw.
+fn rsp_bind(_ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let args = draw_params_try_from(args)?;
 
-    // Quando avviene il bind, mandiamo un messaggio con le specifiche al
-    // dispatcher
-    if let Some(tx) = DISPATCHER_TX.lock().expect("LOCK FALLITO").as_ref() {
-        tx.send(args.clone()).expect("SEND FALLITOH");
+    // Whenever a bind happens, send the specification to the dispatcher.
+    if let Some(tx) = DISPATCHER_TX
+        .lock()
+        .expect("Cannot lock dispatcher")
+        .as_ref()
+    {
+        tx.send(args.clone()).expect("Cannot send to dispatcher");
     }
-
-    // Aggiungo un clone di args per ogni key che potrebbe essere aggiornata.
-    /*
-    args.lists.iter().for_each(|k| {
-        BOUND_KEYS
-            .lock()
-            .unwrap()
-            .entry(k.to_string())
-            .or_insert(vec![])
-            .push(args.clone());
-    });
-    */
 
     Ok(().into())
 }
 
-fn on_list_event(ctx: &Context, ev_type: NotifyEvent, event: &str, key: &str) -> RedisResult {
+fn on_list_event(_ctx: &Context, ev_type: NotifyEvent, event: &str, key: &str) -> RedisResult {
     println!("Some list event! {:?} {} {}", ev_type, event, key);
     // Check if the key that generated the event was bound to something.
     if BOUND_KEYS.lock().unwrap().contains_key(key) {
@@ -223,34 +210,6 @@ fn on_list_event(ctx: &Context, ev_type: NotifyEvent, event: &str, key: &str) ->
         let binding_args = BOUND_KEYS.lock().unwrap().get(key).unwrap().clone();
         for tx in binding_args.into_iter() {
             tx.send(key.to_string()).expect("Cannot send key");
-            /*
-            if false {
-                // Draw on image
-                let w = args.width;
-                let h = args.height;
-                let mut buf: Vec<u8> = vec![0; w * h * 3];
-                let root =
-                    BitMapBackend::with_buffer(&mut buf, (w as u32, h as u32)).into_drawing_area();
-
-                println!("Ok, root is ready, drawing...");
-
-                let sp = plot_spec_try_from(ctx, args)?;
-                plot_complex(root, sp);
-            } else {
-                // Draw on window
-                // TODO use the args to select the target window
-                // FIXME all the block is unsafe, not great...
-                WINDOWS_TX
-                    .lock()
-                    .unwrap()
-                    .get("window")
-                    .unwrap()
-                    .send(key.to_string());
-                //unsafe {
-                //    CHAN_TX.as_ref().map(|ch| ch.send(key.to_string()));
-                //}
-            }
-            */
         }
     }
     Ok(().into())
@@ -281,69 +240,68 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
                 .application_id("re.ale.RedisPlot")
                 .build();
 
-            // TODO GTK might render to a window or to a file.
-            // TODO open the window only when needed.
-            // TODO multiple windows are necessary.
+            // TODO support async render on files, not just windows.
 
             // Activation might be called multiple times, e.g. after being hidden
             app.connect_activate(|app| {
-                // costruisci il dispatcher
                 let bind_tx = {
-                    use glib::clone;
                     use glib::{source::PRIORITY_DEFAULT, MainContext};
                     // Setup communication channel, this is unique for the UI being built.
                     let (tx, rx) = MainContext::channel(PRIORITY_DEFAULT);
                     rx.attach(None, {
                         let app_clone = app.downgrade();
                         move |args: DrawParams| {
-                            println!("RICEVUTI DATI: {:?}", args);
-
                             if let Some(app) = app_clone.upgrade() {
                                 use std::cell::RefCell;
                                 use std::rc::Rc;
 
-                                let plot_spec: Rc<RefCell<Vec<(f32, f32)>>> =
+                                // This is the plot model, it contains all the
+                                // data necessary to plot something
+                                let plot_model: Rc<RefCell<Vec<(f32, f32)>>> =
                                     Rc::new(RefCell::new(vec![]));
 
-                                let plot_spec_clone = plot_spec.clone();
                                 let drawing_area = gtk4::DrawingArea::new();
 
+                                let win = gtk4::Window::builder()
+                                    .application(&app)
+                                    .default_width(args.width as i32)
+                                    .default_height(args.height as i32)
+                                    .title(args.target.as_str())
+                                    .child(&drawing_area)
+                                    .build();
+
+                                // We use the plot model as source of truth when plotting.
+                                // It is the only dependency for the drawing function.
+                                let plot_model_clone = plot_model.clone();
                                 drawing_area.set_draw_func(move |_, cr, w, h| {
                                     use plotters::prelude::*;
-                                    //use redis_module::ThreadSafeContext;
-
                                     let root =
                                         plotters_cairo::CairoBackend::new(cr, (w as u32, h as u32))
                                             .into_drawing_area();
 
-                                    let data = plot_spec_clone.borrow().to_vec();
-                                    println!("Ora plotto!");
+                                    let data = plot_model_clone.borrow().to_vec();
                                     plot_stuff(root, data);
                                 });
-
-                                // let list_box = gtk4::ListBox::new();
-                                // list_box.append(&gtk4::Label::new(Some("999".into())));
 
                                 // Setup communication channel, this is unique for the UI being built.
                                 let (plot_tx, plot_rx) = MainContext::channel(PRIORITY_DEFAULT);
                                 plot_rx.attach(None, {
                                     let drawing_area = drawing_area.downgrade();
+                                    let win = win.downgrade();
                                     move |list_key: String| {
                                         println!("LIST KEY received: {}", list_key);
 
                                         // Get access to redis data
+                                        // TODO there should be a more efficient access method.
                                         use redis_module::ThreadSafeContext;
                                         let thread_ctx = ThreadSafeContext::new();
 
                                         let mut data = {
                                             let ctx = thread_ctx.lock();
 
-                                            // if let Some(spec) = plot_spec_clone.borrow().as_deref() {
-                                            println!("Disegno usando la spec {}", list_key);
                                             let els = ctx
                                                 .call("LRANGE", &[&list_key, "0", "-1"])
                                                 .expect("Cannot lrange");
-                                            // println!("Collecting RSP {:?}", els);
                                             if let RedisValue::Array(els) = els {
                                                 let data: Vec<(f32, f32)> = els
                                                     .into_iter()
@@ -370,28 +328,31 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
                                             }
                                         };
 
-                                        plot_spec.borrow_mut().clear();
-                                        plot_spec.borrow_mut().append(&mut data);
+                                        plot_model.borrow_mut().clear();
+                                        plot_model.borrow_mut().append(&mut data);
 
                                         if let Some(drawing_area) = drawing_area.upgrade() {
                                             drawing_area.queue_draw();
+                                        } else {
+                                            println!("Drawing area cannot be upgraded!");
+                                        }
+                                        // Present upon plot update
+                                        if !args.open {
+                                            if let Some(win) = win.upgrade() {
+                                                println!("Presenting window!");
+                                                win.present();
+                                            } else {
+                                                println!("Window cannot be upgraded!");
+                                            }
                                         }
                                         Continue(true)
                                     }
                                 });
 
-                                let win = gtk4::Window::builder()
-                                    .application(&app)
-                                    .default_width(400)
-                                    .default_height(300)
-                                    .title(args.target.as_str())
-                                    .child(&drawing_area)
-                                    .build();
-
-                                // Forse conviene gestire in qualche modo queste
-                                // finestre in modo da fare present solo quando arrivano
-                                // i dati ed eventualmente aprirle a comando
-                                win.present();
+                                // When presenting immediately
+                                if args.open {
+                                    win.present();
+                                }
 
                                 args.lists.iter().for_each(|k| {
                                     BOUND_KEYS
@@ -401,33 +362,10 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
                                         .or_insert(vec![])
                                         .push(plot_tx.clone());
                                 });
-
-                                // Salva plot_tx da qualche parte per quando
-                                // arrivano i dati da plottare
-                                // TODO questa potrebbe essere come su nuova_lib.rs
+                            } else {
+                                println!("Application cannot be upgraded!");
                             }
 
-                            // let label = gtk4::Label::new(Some(&message));
-                            // list_box.append(&label);
-                            //
-                            // Quando arriva una nuova spec (stringa per ora) la si salva per l'uso
-                            // plot_spec.replace(Some(message));
-                            //
-                            /*
-                                 * TODO deve essere messa qui la creazione della finestra
-                            // We create the main window.
-                            let win = ApplicationWindow::builder()
-                                .application(app)
-                                .default_width(320)
-                                .default_height(200)
-                                .title("RSP")
-                                .child(&drawing_area)
-                                .build();
-                                // Don't forget to make all widgets visible.
-                                win.present();
-                                */
-
-                            // drawing_area.queue_draw();
                             Continue(true)
                         }
                     });
@@ -437,8 +375,9 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
                 // Salvalo da qualche parte
                 let _ = DISPATCHER_TX.lock().expect("LOCK FALLITO").insert(bind_tx);
 
-                // questa cosa è assurda: se tolgo questa finestra, allora non riesco
-                // più ad aprire quelle successive
+                // FIXME if this win gets commented out, no windows will appear at all.
+                // This suggests me that references get lost and weak pointers cannot
+                // upgrade.
                 let win = gtk4::Window::builder()
                     .application(app)
                     .default_width(400)
@@ -446,22 +385,6 @@ fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
                     .title("Boh")
                     .build();
                 win.present();
-
-                // let tx = build_ui(app);
-                // Save the channel so we can send data to it
-                // SAFETY: FIXME, this *should* happen once, but it might not, since
-                // activate is a Fn; so, CHAN_TX might be set multiple times and
-                // the on_list_event might be writing on this. A mutex might be
-                // appropriate
-                /*
-                unsafe {
-                    CHAN_TX = Some(tx);
-                }
-                */
-
-                // let binding_args = BOUND_KEYS.lock().unwrap().get(key).unwrap().clone();
-                // WINDOWS_TX.lock().unwrap().insert("window".to_string(), tx);
-                //: Mutex<HashMap<String, glib::Sender<String>>> = Mutex::new(HashMap::new());
             });
 
             app.run_with_args::<&str>(&[]);
