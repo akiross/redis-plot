@@ -6,6 +6,6 @@ edition = "2021"
 [dependencies]
 clap = { version = "3.2.8", features = ["derive"] }
 redis = "0.21"
-slint = "0.2.4"
-slint-interpreter = { version = "0.2.4", features = ["display-diagnostics"] }
+slint = "0.3.0"
+slint-interpreter = { version = "0.3.0", features = ["display-diagnostics"] }
 spin_on = "0.1.1"

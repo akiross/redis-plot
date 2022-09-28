@@ -15,7 +15,7 @@ lazy_static = "1.4"
 plotters = "0.3"
 plotters-backend = "0.3"
 plotters-cairo = { git = "https://github.com/DusterTheFirst/plotters-cairo", branch = "cairo-rs-0.15.1" }
-redis-module = { version = "1.0.1", features = ["experimental-api", "test"] }
+redis-module = { version = "1.0", features = ["experimental-api", "test"] }
 thiserror = "1"
 tracing = "0.1"
 
