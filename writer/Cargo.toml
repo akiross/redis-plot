@@ -5,26 +5,7 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "3.2.8", features = ["derive"] }
-# flume = "0.10"
-# gio = "0.15"
-# glib = "0.15"
-# gtk4 = "0.4"
-# lazy_static = "1.4"
-# plotters = "0.3"
-# plotters-backend = "0.3"
-# # plotters-cairo = "0.3"
-# plotters-cairo = { git = "https://github.com/DusterTheFirst/plotters-cairo", branch = "cairo-rs-0.15.1" }
 redis = "0.21"
-# redis-module = { version = "1.0.0", features = ["experimental-api", "test"] }
 slint = "0.2.4"
 slint-interpreter = { version = "0.2.4", features = ["display-diagnostics"] }
 spin_on = "0.1.1"
-# thiserror = "1"
-# tracing = "0.1"
-
-# [dev-dependencies]
-# anyhow = "1"
-# tempfile = "3.3"
-# insta = "1.14"
-# itertools = "0.10"
-# serde = "1"

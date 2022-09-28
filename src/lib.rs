@@ -11,19 +11,11 @@
 #[macro_use]
 extern crate redis_module;
 
-#[macro_use]
-extern crate lazy_static;
-
-use redis_module::ThreadSafeContext;
 use redis_module::{
-    Context, LogLevel, NotifyEvent, RedisError, RedisResult, RedisString, RedisValue, Status,
+    Context, NotifyEvent, RedisError, RedisResult, RedisString, RedisValue, Status,
 };
 
-use gtk4::prelude::*;
-
 use plotters::prelude::*;
-use std::collections::HashMap;
-use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
 mod argparse;
@@ -186,7 +178,7 @@ fn rsp_echo(_: &Context, args: Vec<RedisString>) -> RedisResult {
     ))
 }
 
-fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
+fn init_rsp(_ctx: &Context, args: &[RedisString]) -> Status {
     warn!("Initializing rsp....");
 
     if args.len() == 1 {

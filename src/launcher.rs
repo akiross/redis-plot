@@ -1,16 +1,13 @@
+use redis_module::RedisValue;
 use redis_module::ThreadSafeContext;
-use redis_module::{
-    Context, LogLevel, NotifyEvent, RedisError, RedisResult, RedisString, RedisValue, Status,
-};
 
 use gtk4::prelude::*;
 
 use glib::{source::PRIORITY_DEFAULT, MainContext};
-use plotters::prelude::*;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -163,7 +160,7 @@ fn on_connect_activate(app: &gtk4::Application) {
                     win.present();
                 }
 
-                if let Err(e) = args
+                if let Err(_e) = args
                     .lists
                     .iter()
                     .map(|k| match BOUND_KEYS.lock() {
