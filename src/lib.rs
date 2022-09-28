@@ -24,47 +24,18 @@ use gtk4::prelude::*;
 use plotters::prelude::*;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use tracing::{debug, info, warn};
 
 mod argparse;
+mod launcher;
 mod utils;
 
+use launcher::{build_gtk_gui, DrawParams, APP_QUIT, BOUND_KEYS, DISPATCHER_TX};
+
 use argparse::parse_args;
-use utils::{build_ui, plot_complex, plot_stuff, PlotSpec};
+use utils::{plot_complex, PlotSpec};
 
 const COLORS: &[(u8, u8, u8)] = &[(0xff, 0x00, 0x00), (0x00, 0xff, 0x00), (0x00, 0x00, 0xff)];
-
-lazy_static! {
-    // This is the channel to send drawing arguments to the dispatcher when a binding
-    // command arrives, the dispatcher will set up the window and build a channel to
-    // notify when keys are updated. That channel will be added in BOUND_KEYS.
-    static ref DISPATCHER_TX: Mutex<Option<glib::Sender<DrawParams>>> = Mutex::new(None);
-
-    // Maps redis keys to channels that are used to notify the dispatcher when new data
-    // is available. When an event happens for a given key, the key name shall be sent
-    // over its channel: the dispatcher will read that key and update the plot.
-    static ref BOUND_KEYS: Mutex<HashMap<String, Vec<glib::Sender<String>>>> = Mutex::new(HashMap::new());
-
-    // This is a channel that is used to signal when the app shall terminate.
-    static ref APP_QUIT: Mutex<Option<glib::Sender<()>>> = Mutex::new(None);
-}
-
-#[derive(Clone, Debug)]
-struct DrawParams {
-    lists: Vec<String>,
-    width: usize,
-    height: usize,
-    target: String,
-    /// Shall the window be opened upon binding
-    // FIXME pick a better name: the choice is either present it once or on update
-    // FIXME it actually might be two separated options...
-    open: bool,
-}
-
-/// Logs a message, since ctx.log seems to have stopped working, I'm using println.
-fn log_msg(ctx: &Context, level: LogLevel, message: &str) {
-    println!("(REDIS_PLOT) {}", message);
-    ctx.log(level, message);
-}
 
 // TODO implement TryFrom for DrawParams, possibly dropping parse_args.
 /// Parse the arguments and return DrawParams.
@@ -175,13 +146,8 @@ fn rsp_draw(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
 fn rsp_bind(_ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let args = draw_params_try_from(args)?;
 
-    // Whenever a bind happens, send the specification to the dispatcher.
-    if let Some(tx) = DISPATCHER_TX
-        .lock()
-        .expect("Cannot lock dispatcher")
-        .as_ref()
-    {
-        tx.send(args.clone()).expect("Cannot send to dispatcher");
+    if let Some(tx) = DISPATCHER_TX.lock()?.as_ref() {
+        tx.send(args.clone())?;
     }
 
     Ok(().into())
@@ -189,14 +155,17 @@ fn rsp_bind(_ctx: &Context, args: Vec<RedisString>) -> RedisResult {
 
 fn on_list_event(_ctx: &Context, ev_type: NotifyEvent, event: &str, key: &str) -> RedisResult {
     println!("Some list event! {:?} {} {}", ev_type, event, key);
-    // Check if the key that generated the event was bound to something.
-    if BOUND_KEYS.lock().unwrap().contains_key(key) {
-        println!("This key '{}' was watched, plotting!", key);
 
-        // There might be multiple plots bound to this key
-        let binding_args = BOUND_KEYS.lock().unwrap().get(key).unwrap().clone();
-        for tx in binding_args.into_iter() {
-            tx.send(key.to_string()).expect("Cannot send key");
+    // Check if the key that generated the event was bound to something.
+    if let Ok(guard) = BOUND_KEYS.lock() {
+        if let Some(binding_args) = guard.get(key) {
+            println!("This key '{}' was watched, plotting!", key);
+
+            // There might be multiple plots bound to this key
+            let binding_args = binding_args.clone();
+            for tx in binding_args.into_iter() {
+                tx.send(key.to_string())?;
+            }
         }
     }
     Ok(().into())
@@ -218,209 +187,40 @@ fn rsp_echo(_: &Context, args: Vec<RedisString>) -> RedisResult {
 }
 
 fn init_rsp(ctx: &Context, args: &[RedisString]) -> Status {
-    log_msg(ctx, LogLevel::Warning, "Initializing rsp....");
+    warn!("Initializing rsp....");
 
     if args.len() == 1 {
-        log_msg(ctx, LogLevel::Notice, "Plotting to file");
+        info!("Plotting to file");
     } else {
         // println!("LOADING MODULE WITH ARGS {:?}", _args);
         std::thread::spawn(|| {
-            use glib::{source::PRIORITY_DEFAULT, MainContext};
-
-            let app = gtk4::Application::builder()
-                .application_id("re.ale.RedisPlot")
-                .build();
-
-            // The app will be held until a termination signal arrives, so we can have it
-            // running even when there are no windows
-            app.hold();
-            let (app_tx, app_rx) = MainContext::channel(PRIORITY_DEFAULT);
-            app_rx.attach(None, {
-                let app = app.downgrade();
-                move |_| {
-                    if let Some(app) = app.upgrade() {
-                        // Stop holding the app
-                        app.release();
-                        // FIXME the lock() method below seems to stall.
-                        // Send message
-                        // let thread_ctx = ThreadSafeContext::new();
-                        // println!("Locking...");
-                        // let ctx = thread_ctx.lock();
-                        // println!("Locked!");
-                        // log_msg(&ctx, LogLevel::Warning, "Application released");
-                        // println!("Done writing");
-                    } else {
-                        println!("Cannot upgrade application!");
-                    }
-                    Continue(true)
-                }
-            });
-            let _ = APP_QUIT.lock().expect("Cannot lock").insert(app_tx);
-
-            // Debug some events
-            app.connect_window_added(|_, _| {
-                let thread_ctx = ThreadSafeContext::new();
-                let ctx = thread_ctx.lock();
-                log_msg(&ctx, LogLevel::Debug, "Window added to application");
-            });
-            app.connect_window_removed(|_, _| {
-                let thread_ctx = ThreadSafeContext::new();
-                let ctx = thread_ctx.lock();
-                log_msg(&ctx, LogLevel::Debug, "Window removed from application");
-            });
-
-            // TODO support async render on files, not just windows.
-
-            // Activation might be called multiple times, e.g. after being hidden
-            app.connect_activate(|app| {
-                let bind_tx = {
-                    // Setup communication channel, this is unique for the UI being built.
-                    let (tx, rx) = MainContext::channel(PRIORITY_DEFAULT);
-                    rx.attach(None, {
-                        let app_clone = app.downgrade();
-                        move |args: DrawParams| {
-                            if let Some(app) = app_clone.upgrade() {
-                                use std::cell::RefCell;
-                                use std::rc::Rc;
-
-                                // This is the plot model, it contains all the
-                                // data necessary to plot something
-                                let plot_model: Rc<RefCell<Vec<(f32, f32)>>> =
-                                    Rc::new(RefCell::new(vec![]));
-
-                                let drawing_area = gtk4::DrawingArea::new();
-
-                                let win = gtk4::Window::builder()
-                                    .application(&app)
-                                    .default_width(args.width as i32)
-                                    .default_height(args.height as i32)
-                                    .hide_on_close(true) // To open it on render
-                                    .title(args.target.as_str())
-                                    .child(&drawing_area)
-                                    .build();
-
-                                // We use the plot model as source of truth when plotting.
-                                // It is the only dependency for the drawing function.
-                                let plot_model_clone = plot_model.clone();
-                                drawing_area.set_draw_func(move |_, cr, w, h| {
-                                    use plotters::prelude::*;
-                                    let root =
-                                        plotters_cairo::CairoBackend::new(cr, (w as u32, h as u32))
-                                            .into_drawing_area();
-
-                                    let data = plot_model_clone.borrow().to_vec();
-                                    plot_stuff(root, data);
-                                });
-
-                                // Setup communication channel, this is unique for the UI being built.
-                                let (plot_tx, plot_rx) = MainContext::channel(PRIORITY_DEFAULT);
-                                plot_rx.attach(None, {
-                                    let drawing_area = drawing_area.downgrade();
-                                    let win = win.downgrade();
-                                    move |list_key: String| {
-                                        println!("LIST KEY received: {}", list_key);
-
-                                        // Get access to redis data
-                                        // TODO there should be a more efficient access method.
-                                        let thread_ctx = ThreadSafeContext::new();
-
-                                        let mut data = {
-                                            println!("DATA-CTX locking...");
-                                            let ctx = thread_ctx.lock();
-                                            println!("DATA-CTX locked!");
-
-                                            let els = ctx
-                                                .call("LRANGE", &[&list_key, "0", "-1"])
-                                                .expect("Cannot lrange");
-                                            if let RedisValue::Array(els) = els {
-                                                let data: Vec<(f32, f32)> = els
-                                                    .into_iter()
-                                                    .enumerate()
-                                                    .filter_map(|(i, v)| match v {
-                                                        // FIXME this unwrap shall be changed into a None
-                                                        RedisValue::SimpleString(v) => Some((
-                                                            i as f32,
-                                                            v.parse::<f32>().unwrap(),
-                                                        )),
-                                                        RedisValue::Integer(v) => {
-                                                            Some((i as f32, v as f32))
-                                                        }
-                                                        RedisValue::Float(v) => {
-                                                            Some((i as f32, v as f32))
-                                                        }
-                                                        _ => None,
-                                                    })
-                                                    .collect();
-                                                data
-                                            } else {
-                                                // list_key was not found!
-                                                vec![]
-                                            }
-                                        };
-                                        println!("DATA-CTX unlocked");
-
-                                        plot_model.borrow_mut().clear();
-                                        plot_model.borrow_mut().append(&mut data);
-
-                                        if let Some(drawing_area) = drawing_area.upgrade() {
-                                            drawing_area.queue_draw();
-                                        } else {
-                                            println!("Drawing area cannot be upgraded!");
-                                        }
-                                        // Present upon plot update
-                                        if !args.open {
-                                            if let Some(win) = win.upgrade() {
-                                                println!("Presenting window!");
-                                                win.present();
-                                            } else {
-                                                println!("Window cannot be upgraded!");
-                                            }
-                                        }
-                                        Continue(true)
-                                    }
-                                });
-
-                                // When presenting immediately
-                                if args.open {
-                                    win.present();
-                                }
-
-                                args.lists.iter().for_each(|k| {
-                                    BOUND_KEYS
-                                        .lock()
-                                        .unwrap()
-                                        .entry(k.to_string())
-                                        .or_insert(vec![])
-                                        .push(plot_tx.clone());
-                                });
-                            } else {
-                                println!("Application cannot be upgraded!");
-                            }
-
-                            Continue(true)
-                        }
-                    });
-                    tx
-                };
-
-                // Salvalo da qualche parte
-                let _ = DISPATCHER_TX.lock().expect("Cannot lock").insert(bind_tx);
-            });
-
-            app.run_with_args::<&str>(&[]);
+            build_gtk_gui();
         });
     }
 
-    log_msg(ctx, LogLevel::Notice, "redis_plot initialized");
+    info!("redis_plot initialized");
     Status::Ok
 }
 
 fn deinit_rsp(ctx: &Context) -> Status {
-    log_msg(ctx, LogLevel::Notice, "De-initializing redis_plot");
-    if let Some(tx) = APP_QUIT.lock().expect("Cannot lock").as_ref() {
-        log_msg(ctx, LogLevel::Debug, "Sending term signal...");
-        tx.send(()).expect("Cannot send term signal");
+    info!("De-initializing redis_plot");
+
+    if let Ok(guard) = APP_QUIT.lock() {
+        if let Some(tx) = guard.as_ref() {
+            debug!("Sending term signal...");
+            if let Err(_e) = tx.send(()) {
+                //warn!("Cannot send termination signal");
+                ctx.reply_error_string("Cannot send termination signal");
+                return Status::Err;
+            }
+        } else {
+            warn!("APP_QUIT has no value, initialization might have failed.");
+        }
+    } else {
+        ctx.reply_error_string("Cannot lock APP_QUIT");
+        return Status::Err;
     }
+
     Status::Ok
 }
 

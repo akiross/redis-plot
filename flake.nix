@@ -77,7 +77,7 @@
             glib
             gtk4
             libclang
-            pkgconfig
+            pkg-config
             pre-commit
             redis
             rustPackages.clippy

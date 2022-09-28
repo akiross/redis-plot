@@ -1,11 +1,99 @@
 /// This tool produces a GUI that writes values to redis variables.
 /// It reads a .slint file with the GUI and automatically binds the values
 /// to functions that write the data on redis (write only!)
+use clap::Parser;
 use redis::Commands;
 use slint::Model;
 use slint_interpreter::{ComponentCompiler, ComponentHandle, SharedString, Value};
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
+
+/// Structure for CLI options.
+#[derive(Debug, Parser)]
+#[clap(
+    author = "Alessandro 'AkiRoss' Re",
+    name = "writer",
+    about = "A tool to quickly render GUIs that allow to write to redis",
+    long_about = r#"This tool helps in sending data to redis by showing a custom UI
+    that can be used to write custom values to custom variables.
+
+    UIs are built using the slint language (see slint-ui.com) and using some
+    custom callbacks to send data to redis.
+
+    In brief, when writer is started with a UI file, e.g. using
+
+    ```
+    ./writer my_ui.slint
+    ```
+
+    the program will build the UI dynamically and try to bind callbacks matching
+    the following templates
+
+    ```
+    <set|lpush|rpush>_<i32|f32|bool|string>(string, <type>)
+    cmd(string, [string])
+    ```
+
+    Those callbacks will send data to redis when called, using the first argument,
+    of type string, as the redis key and the second argument as value.
+
+    Here's an example:
+
+    ```
+    // Save this file as my_ui.slint and run
+    import { VerticalBox, LineEdit, Button, Slider } from "std-widgets.slint";
+
+    MainWindow := Window {
+        // This is the "API for this writer application.
+        // There is a family of callbacks to send data to redis, with name
+        // (set|lpush|rpush)_(i32|f32|bool|string) and arguments (string, value).
+        //
+        // Commands can be set with the cmd(string, [string]) callback.
+    
+        // Here we define the callback we will use: the writer will bind them
+        // to their redis commands.
+        callback set_i32(string, int);
+        callback rpush_i32(string, int);
+        callback cmd(string, [string]);
+    
+        // Now I define a simple UI with a text field that gets the redis key
+        // to write, a button to bind a (redis-)plot to its value and a slider
+        // that pushes a value into that key whenever it changes.
+        VerticalBox {
+            variable := LineEdit {
+                placeholder-text: "Variable";
+            }
+    
+            button := Button {
+                text: "Press to bind to list " + variable.text;
+                clicked => {
+                    // Calling the callback to run a custom command when the
+                    // button gets pressed.
+                    root.cmd("rsp.bind", ["--list", variable.text]);
+                }
+            }
+    
+            Slider {
+                minimum: -100;
+                maximum: 100;
+                value: 0;
+                changed(x) => {
+                    // Whenever the slider changes, I push its value to the
+                    // key specified in the text field.
+                    root.rpush_i32(variable.text, x);
+                }
+            }
+        }
+    }
+    ```
+    "#
+)]
+struct CliOpt {
+    /// Path of the .slint file to render.
+    #[clap(parse(from_os_str))]
+    input: PathBuf,
+}
 
 // Wrapper, this wraps Value into something that has TryFrom (missing from slint 0.2.4 but
 // a patch has landed: waiting the next release to remove this, see slint issue #1258).
@@ -167,8 +255,10 @@ fn make_rpush_callback_str(
 }
 
 fn main() {
+    let opt = CliOpt::from_args();
+
     let mut compiler = ComponentCompiler::default();
-    let definition = spin_on::spin_on(compiler.build_from_path("hello.slint"));
+    let definition = spin_on::spin_on(compiler.build_from_path(opt.input));
 
     slint_interpreter::print_diagnostics(&compiler.diagnostics());
 
