@@ -1184,8 +1184,9 @@ dependencies = [
 
 [[package]]
 name = "plotters-cairo"
-version = "0.3.1"
-source = "git+https://github.com/DusterTheFirst/plotters-cairo?branch=cairo-rs-0.15.1#21e81402c105dd1717c69e01a5020d5bef6d1b69"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad329f140235af4d41913a220f2c9ab5da42d0d09132435fd3d981ad647325db"
 dependencies = [
  "cairo-rs",
  "plotters-backend",

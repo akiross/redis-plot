@@ -67,60 +67,6 @@ pub fn plot_complex<DB>(
     }
 }
 
-// This is the function that performs the plotting for different backends.
-pub fn plot_stuff<DB>(
-    root: plotters::drawing::DrawingArea<DB, plotters::coord::Shift>,
-    data: Vec<(f32, f32)>,
-) where
-    DB: plotters_backend::DrawingBackend,
-{
-    use plotters::prelude::*;
-    root.fill(&WHITE).unwrap();
-    //let root = root.margin(25, 25, 25, 25);
-
-    let (x_range, y_range) = {
-        let mut x_min: Option<f32> = None;
-        let mut x_max: Option<f32> = None;
-        let mut y_min: Option<f32> = None;
-        let mut y_max: Option<f32> = None;
-
-        for (x, y) in data.iter() {
-            if x < x_min.get_or_insert(*x) {
-                x_min.replace(*x);
-            }
-            if x > x_max.get_or_insert(*x) {
-                x_max.replace(*x);
-            }
-            if y < y_min.get_or_insert(*y) {
-                y_min.replace(*y);
-            }
-            if y > y_max.get_or_insert(*y) {
-                y_max.replace(*y);
-            }
-        }
-        if x_min.is_none() || x_max.is_none() || y_min.is_none() || y_max.is_none() {
-            (0.0..0.0, 0.0..0.0)
-        } else {
-            (
-                x_min.unwrap()..x_max.unwrap(),
-                y_min.unwrap()..y_max.unwrap(),
-            )
-        }
-    };
-
-    let mut chart = ChartBuilder::on(&root)
-        .margin(25i32)
-        .x_label_area_size(30)
-        .y_label_area_size(30)
-        .caption("RSPlotters", ("sans-serif", 20u32))
-        .build_cartesian_2d(x_range, y_range)
-        .unwrap();
-
-    chart.configure_mesh().draw().unwrap();
-
-    chart.draw_series(LineSeries::new(data, &RED)).unwrap();
-}
-
 #[cfg(test)]
 mod tests {
     #[test]

@@ -1,4 +1,4 @@
-use redis_module::RedisValue;
+//use redis_module::RedisValue;
 use redis_module::ThreadSafeContext;
 
 use gtk4::prelude::*;
@@ -9,19 +9,18 @@ use std::sync::Mutex;
 
 use tracing::{debug, warn};
 
-use std::cell::RefCell;
-use std::rc::Rc;
-//mod argparse;
-//mod utils;
+// use std::cell::RefCell;
+//use std::rc::Rc;
 
 //use argparse::parse_args;
-use crate::utils::plot_stuff;
+use crate::plot_spec_try_from;
+use crate::utils::plot_complex;
 
 lazy_static::lazy_static! {
     // This is the channel to send drawing arguments to the dispatcher when a binding
     // command arrives, the dispatcher will set up the window and build a channel to
     // notify when keys are updated. That channel will be added in BOUND_KEYS.
-    pub static ref DISPATCHER_TX: Mutex<Option<glib::Sender<DrawParams>>> = Mutex::new(None);
+    pub static ref DISPATCHER_TX: Mutex<Option<glib::Sender<BindParams>>> = Mutex::new(None);
 
     // Maps redis keys to channels that are used to notify the dispatcher when new data
     // is available. When an event happens for a given key, the key name shall be sent
@@ -33,11 +32,18 @@ lazy_static::lazy_static! {
 }
 
 #[derive(Clone, Debug)]
-pub struct DrawParams {
+pub struct BindParams {
     pub lists: Vec<String>,
     pub width: usize,
     pub height: usize,
+    // TODO a target should correspond to a single output window and should allow
+    // users to change/redefine how data is plotted on it.
     pub target: String,
+    // This defines what index is used for data:
+    // natural means 0 1 2 3...
+    // xy means x and y are provided as elements in the list: x y x y x y ...
+    // zip means x is from one list, y from another
+    pub index: String,
     /// Shall the window be opened upon binding
     // FIXME pick a better name: the choice is either present it once or on update
     // FIXME it actually might be two separated options...
@@ -46,52 +52,18 @@ pub struct DrawParams {
 
 #[derive(thiserror::Error, Debug)]
 pub enum Errors {
-    #[error("Unable to call LRANGE to read key data")]
-    CannotCallLrange,
     #[error("Unable to lock mutex")]
     CannotLockMutex,
 }
 
-fn get_key_data(list_key: String) -> Result<Vec<(f32, f32)>, Errors> {
-    let thread_ctx = ThreadSafeContext::new();
-    println!("DATA-CTX locking...");
-    let ctx = thread_ctx.lock();
-    println!("DATA-CTX locked!");
-
-    let els = ctx
-        .call("LRANGE", &[&list_key, "0", "-1"])
-        .map_err(|_| Errors::CannotCallLrange)?;
-
-    if let RedisValue::Array(els) = els {
-        let data: Vec<(f32, f32)> = els
-            .into_iter()
-            .enumerate()
-            .filter_map(|(i, v)| match v {
-                // Assuming that if a string cannot be converted to f32, then it's ok to ignore it
-                RedisValue::SimpleString(v) => v.parse::<f32>().ok().map(|v| (i as f32, v)),
-                RedisValue::Integer(v) => Some((i as f32, v as f32)),
-                RedisValue::Float(v) => Some((i as f32, v as f32)),
-                _ => None,
-            })
-            .collect();
-        Ok(data)
-    } else {
-        // list_key was not found!
-        Ok(vec![])
-    }
-}
-
 fn on_connect_activate(app: &gtk4::Application) {
     // Setup communication channel, this is unique for the UI being built.
+    // Whenever a message arrives on this channel, we set up a new window.
     let (bind_tx, bind_rx) = MainContext::channel(PRIORITY_DEFAULT);
     bind_rx.attach(None, {
         let app_clone = app.downgrade();
-        move |args: DrawParams| {
+        move |args: BindParams| {
             if let Some(app) = app_clone.upgrade() {
-                // This is the plot model, it contains all the
-                // data necessary to plot something
-                let plot_model: Rc<RefCell<Vec<(f32, f32)>>> = Rc::new(RefCell::new(vec![]));
-
                 let drawing_area = gtk4::DrawingArea::new();
 
                 let win = gtk4::Window::builder()
@@ -105,14 +77,24 @@ fn on_connect_activate(app: &gtk4::Application) {
 
                 // We use the plot model as source of truth when plotting.
                 // It is the only dependency for the drawing function.
-                let plot_model_clone = plot_model.clone();
+                // let plot_model_clone = plot_model.clone();
+                let args_clone = args.clone();
                 drawing_area.set_draw_func(move |_, cr, w, h| {
                     use plotters::prelude::*;
+
                     let root = plotters_cairo::CairoBackend::new(cr, (w as u32, h as u32))
+                        .expect("Unable to get cairo backend")
                         .into_drawing_area();
 
-                    let data = plot_model_clone.borrow().to_vec();
-                    plot_stuff(root, data);
+                    // Build spec, accessing the DB via a threaded context
+                    let thread_ctx = ThreadSafeContext::new();
+                    let ctx = thread_ctx.lock();
+
+                    // Prepare the data for plotting
+                    let sp = plot_spec_try_from(&*ctx, &args_clone).expect("Cannot build spec");
+
+                    // Plot the data on the root
+                    plot_complex(root, sp);
                 });
 
                 // Setup communication channel, this is unique for the UI being built.
@@ -120,23 +102,8 @@ fn on_connect_activate(app: &gtk4::Application) {
                 plot_rx.attach(None, {
                     let drawing_area = drawing_area.downgrade();
                     let win = win.downgrade();
-                    move |list_key: String| {
-                        println!("LIST KEY received: {}", list_key);
-
-                        // Get access to redis data
-                        // TODO there should be a more efficient access method.
-                        let mut data = match get_key_data(list_key) {
-                            Ok(data) => data,
-                            Err(_) => {
-                                warn!("Cannot get data, skipping");
-                                return Continue(true);
-                            }
-                        };
-                        println!("DATA-CTX unlocked");
-
-                        plot_model.borrow_mut().clear();
-                        plot_model.borrow_mut().append(&mut data);
-
+                    move |_: String| {
+                        // Schedule redraw
                         if let Some(drawing_area) = drawing_area.upgrade() {
                             drawing_area.queue_draw();
                         } else {
@@ -145,7 +112,6 @@ fn on_connect_activate(app: &gtk4::Application) {
                         // Present upon plot update
                         if !args.open {
                             if let Some(win) = win.upgrade() {
-                                println!("Presenting window!");
                                 win.present();
                             } else {
                                 warn!("Window cannot be upgraded!");
@@ -175,10 +141,10 @@ fn on_connect_activate(app: &gtk4::Application) {
                     })
                     .collect::<Result<Vec<()>, Errors>>()
                 {
-                    warn!("ERRORE!");
+                    warn!("Cannot lock mutex to read bound keys!");
                 }
             } else {
-                println!("Application cannot be upgraded!");
+                warn!("Application cannot be upgraded!");
             }
 
             Continue(true)

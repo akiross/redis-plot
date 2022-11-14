@@ -22,7 +22,7 @@ mod argparse;
 mod launcher;
 mod utils;
 
-use launcher::{build_gtk_gui, DrawParams, APP_QUIT, BOUND_KEYS, DISPATCHER_TX};
+use launcher::{build_gtk_gui, BindParams, APP_QUIT, BOUND_KEYS, DISPATCHER_TX};
 
 use argparse::parse_args;
 use utils::{plot_complex, PlotSpec};
@@ -31,7 +31,7 @@ const COLORS: &[(u8, u8, u8)] = &[(0xff, 0x00, 0x00), (0x00, 0xff, 0x00), (0x00,
 
 // TODO implement TryFrom for DrawParams, possibly dropping parse_args.
 /// Parse the arguments and return DrawParams.
-fn draw_params_try_from(args: Vec<RedisString>) -> Result<DrawParams, RedisError> {
+fn draw_params_try_from(args: Vec<RedisString>) -> Result<BindParams, RedisError> {
     // Parse the arguments into a map. Checks on arity will be performed later.
     let args = parse_args(args.into_iter().map(|s| s.to_string()).collect());
 
@@ -45,51 +45,159 @@ fn draw_params_try_from(args: Vec<RedisString>) -> Result<DrawParams, RedisError
         return Err(RedisError::WrongArity);
     }
 
-    Ok(DrawParams {
+    // --width and --height accept a single integer argument
+    let width = match args.get("--width") {
+        None => Ok(400),
+        Some(a) => {
+            if a.len() != 1 {
+                Err(RedisError::WrongArity)
+            } else {
+                a[0].parse()
+                    .map_err(|_| RedisError::Str("Width cannot be parsed as unsigned int"))
+            }
+        }
+    }?;
+
+    let height = match args.get("--height") {
+        None => Ok(300),
+        Some(a) => {
+            if a.len() != 1 {
+                Err(RedisError::WrongArity)
+            } else {
+                a[0].parse()
+                    .map_err(|_| RedisError::Str("Height cannot be parsed as unsigned int"))
+            }
+        }
+    }?;
+
+    let target = match args.get("--target") {
+        None => Ok("out_win".to_string()),
+        Some(a) => {
+            if a.len() != 1 {
+                Err(RedisError::WrongArity)
+            } else {
+                Ok(a[0].clone())
+            }
+        }
+    }?;
+
+    let index = match args.get("--index") {
+        None => Ok("natural".to_string()),
+        Some(a) => {
+            if a.len() != 1 {
+                Err(RedisError::WrongArity)
+            } else {
+                Ok(a[0].clone())
+            }
+        }
+    }?;
+
+    if index == "zip" && lists.len() != 2 {
+        return Err(RedisError::Str(
+            "zip index needs exactly 2 lists as argument",
+        ));
+    }
+
+    Ok(BindParams {
         lists,
-        width: 400,
-        height: 300,
-        target: "out_win".to_string(),
+        width,
+        height,
+        target,
+        index,
         open: false,
     })
 }
 
-fn plot_spec_try_from(ctx: &Context, args: DrawParams) -> Result<PlotSpec, RedisError> {
-    let DrawParams {
+fn plot_spec_try_from(ctx: &Context, args: &BindParams) -> Result<PlotSpec, RedisError> {
+    let BindParams {
         lists,
         width: _,
         height: _,
         target: _,
+        index,
         open: _,
     } = args;
 
-    // Read all the data for all the lists
-    let mut ld = vec![];
-    for l in lists.into_iter() {
-        // Get the data for this list
-        let d = ctx.call("LRANGE", &[&l, "0", "-1"])?;
+    // Depending on the "index", we interpret the source of data in different ways
+    let ld = match index.as_str() {
+        // When user "zip"s, the indices and the values are taken from 2 lists
+        "zip" => {
+            let mut ld = vec![];
+            let lx = &lists[0];
+            let ly = &lists[1];
+            let dx = ctx.call("LRANGE", &[&lx, "0", "-1"])?;
+            let dy = ctx.call("LRANGE", &[&ly, "0", "-1"])?;
 
-        // Ensure it's an array and extract data from it.
-        if let RedisValue::Array(els) = d {
-            let data: Vec<(f32, f32)> = els
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, v)| match v {
-                    // Try to parse the string, return None (ignore value) on fail.
-                    RedisValue::SimpleString(v) => Some((i as f32, v.parse::<f32>().ok()?)),
-                    // Note we are using f32 for points, there might be loss of precision.
-                    RedisValue::Integer(v) => Some((i as f32, v as f32)),
-                    RedisValue::Float(v) => Some((i as f32, v as f32)),
-                    _ => None,
-                })
-                .collect();
+            match (dx, dy) {
+                (RedisValue::Array(dx), RedisValue::Array(dy)) => {
+                    let data: Vec<(f32, f32)> = std::iter::zip(dx.into_iter(), dy.into_iter())
+                        .filter_map(|v| match v {
+                            (RedisValue::SimpleString(x), RedisValue::SimpleString(y)) => {
+                                Some((x.parse::<f32>().ok()?, y.parse::<f32>().ok()?))
+                            }
+                            (RedisValue::Integer(x), RedisValue::Float(y)) => {
+                                Some((x as f32, y as f32))
+                            }
+                            (RedisValue::Float(x), RedisValue::Integer(y)) => {
+                                Some((x as f32, y as f32))
+                            }
+                            (RedisValue::Integer(x), RedisValue::Integer(y)) => {
+                                Some((x as f32, y as f32))
+                            }
+                            (RedisValue::Float(x), RedisValue::Float(y)) => {
+                                Some((x as f32, y as f32))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    ld.push(data);
+                }
+                _ => {
+                    return Err(RedisError::String(format!(
+                        "{} or {} is not an array",
+                        lx, ly
+                    )));
+                }
+            }
 
-            // Get the data
-            ld.push(data);
-        } else {
-            return Err(RedisError::String(format!("{} is not an array", l)));
+            ld
         }
-    }
+        // When user "xy"s, the indices and the values are interleaved in a list
+        // e.g. powers_of_2 = 0 1  1 2  2 4  3 8  4 16  5 32...
+        "xy" => {
+            todo!("Not done yet!")
+        }
+        _ => {
+            // Read all the data for all the lists
+            let mut ld = vec![];
+            for l in lists.into_iter() {
+                // Get the data for this list
+                let d = ctx.call("LRANGE", &[&l, "0", "-1"])?;
+
+                // Ensure it's an array and extract data from it.
+                if let RedisValue::Array(els) = d {
+                    let data: Vec<(f32, f32)> = els
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(i, v)| match v {
+                            // Try to parse the string, return None (ignore value) on fail.
+                            RedisValue::SimpleString(v) => Some((i as f32, v.parse::<f32>().ok()?)),
+                            // Note we are using f32 for points, there might be loss of precision.
+                            RedisValue::Integer(v) => Some((i as f32, v as f32)),
+                            RedisValue::Float(v) => Some((i as f32, v as f32)),
+                            _ => None,
+                        })
+                        .collect();
+
+                    // Get the data
+                    ld.push(data);
+                } else {
+                    return Err(RedisError::String(format!("{} is not an array", l)));
+                }
+            }
+            ld
+        }
+    };
 
     Ok(PlotSpec {
         color: (0..ld.len()).map(|i| COLORS[i % COLORS.len()]).collect(),
@@ -114,10 +222,9 @@ fn rsp_draw(ctx: &Context, args: Vec<RedisString>) -> RedisResult {
     let h = args.height;
 
     // Prepare the data for plotting
-    let sp = plot_spec_try_from(ctx, args)?;
+    let sp = plot_spec_try_from(ctx, &args)?;
 
     // Plot the data on a buffer bitmap
-    // TODO read size from args.
     let mut buf: Vec<u8> = vec![0; w * h * 3];
     let root = BitMapBackend::with_buffer(&mut buf, (w as u32, h as u32)).into_drawing_area();
 
@@ -184,7 +291,6 @@ fn init_rsp(_ctx: &Context, args: &[RedisString]) -> Status {
     if args.len() == 1 {
         info!("Plotting to file");
     } else {
-        // println!("LOADING MODULE WITH ARGS {:?}", _args);
         std::thread::spawn(|| {
             build_gtk_gui();
         });
@@ -223,14 +329,9 @@ redis_module! {
     init: init_rsp,
     deinit: deinit_rsp,
     commands: [
-        // x are assumed to be natural numbers, but a flag might be used to load them from a list.
         ["rsp.draw", rsp_draw, "", 0, 0, 0],
         ["rsp.bind", rsp_bind, "", 0, 0, 0],
         ["rsp.echo", rsp_echo, "", 0, 0, 0],
-        // rsp.line
-        // rsp.dots
-        // rsp.bars a bar for each y-value. more keys will produce side-to-side bars, flag to stack
-        // rsp.hist
     ],
     event_handlers: [
         [@LIST: on_list_event]

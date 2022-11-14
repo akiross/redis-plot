@@ -3,10 +3,10 @@
 This is a redis module that collect data from keys and plot them on screen.
 
 For now it's simple, stupid and dirty (as in: the code is a mess): it allows
-to plot one or more lists as lines onto a window (or a buffer), but it's usable
-for simple tasks.
+to plot one or more lists as lines onto a window (or a buffer), but it's still
+usable for simple tasks.
 
-There are a few automated tests, but they only check the routines plotting to
+There are a few automated tests, but they only check the routines that plot to
 string. There is no automated tests involving the windowing part.
 
 ## Usage
